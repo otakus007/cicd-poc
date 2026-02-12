@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECR Repository Stack for CI/CD Pipeline.
+  Creates ECR repository with scan-on-push enabled for vulnerability detection
+  and lifecycle policy to retain last 10 tagged images.
+  Requirements: 5.2 (lifecycle policy), 5.3 (scan-on-push), 5.5 (retain 10 images)
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # ECR Repository
+  # Purpose: Stores Docker container images for the application
+  # Features:
+  #   - Scan-on-push enabled for vulnerability detection (Requirement 5.3)
+  #   - Lifecycle policy to retain last 10 tagged images (Requirements 5.2, 5.5)
+  #   - AES256 encryption for images at rest
+  #   - Mutable image tags for latest tag updates
+  # ---------------------------------------------------------------------------
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-${Environment}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 tagged images with v prefix",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecr
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Container Image Repository
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Repository URI - used for pushing and pulling images
+  RepositoryUri:
+    Description: ECR Repository URI for pushing and pulling images
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcrRepositoryUri
+
+  # Repository ARN - used for IAM policies and cross-stack references
+  RepositoryArn:
+    Description: ECR Repository ARN for IAM policies
+    Value: !GetAtt ECRRepository.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcrRepositoryArn
+
+  # Repository Name - used for CLI commands and references
+  RepositoryName:
+    Description: ECR Repository Name
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcrRepositoryName
+
