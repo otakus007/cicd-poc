@@ -1,0 +1,610 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CodeBuild Projects Stack for CI/CD Pipeline.
+  Creates CodeBuild projects for each pipeline stage: Source, Lint, Build, Push, and Contract Test.
+  Each project is configured with appropriate compute types, Docker images, and CloudWatch Logs.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - PrivateSubnet1Id
+          - PrivateSubnet2Id
+          - CodeBuildSecurityGroupId
+      - Label:
+          default: "Repository Configuration"
+        Parameters:
+          - AzureDevOpsOrganization
+          - AzureDevOpsProject
+          - AzureDevOpsRepository
+          - BranchName
+      - Label:
+          default: "ECR Configuration"
+        Parameters:
+          - EcrRepositoryUri
+      - Label:
+          default: "API Gateway Configuration"
+        Parameters:
+          - ApiGatewayEndpoint
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      VpcId:
+        default: "VPC ID"
+      PrivateSubnet1Id:
+        default: "Private Subnet 1 ID"
+      PrivateSubnet2Id:
+        default: "Private Subnet 2 ID"
+      CodeBuildSecurityGroupId:
+        default: "CodeBuild Security Group ID"
+      AzureDevOpsOrganization:
+        default: "Azure DevOps Organization"
+      AzureDevOpsProject:
+        default: "Azure DevOps Project"
+      AzureDevOpsRepository:
+        default: "Azure DevOps Repository"
+      BranchName:
+        default: "Branch Name"
+      EcrRepositoryUri:
+        default: "ECR Repository URI"
+      ApiGatewayEndpoint:
+        default: "API Gateway Endpoint"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  CodeBuildRoleArn:
+    Type: String
+    Description: ARN of the IAM role for CodeBuild projects
+
+  PatSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing Azure DevOps PAT
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where CodeBuild projects will run
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet 1 ID for CodeBuild VPC configuration
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet 2 ID for CodeBuild VPC configuration
+
+  CodeBuildSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID for CodeBuild projects
+
+  AzureDevOpsOrganization:
+    Type: String
+    Description: Azure DevOps organization name
+    MinLength: 1
+    MaxLength: 100
+
+  AzureDevOpsProject:
+    Type: String
+    Description: Azure DevOps project name
+    MinLength: 1
+    MaxLength: 100
+
+  AzureDevOpsRepository:
+    Type: String
+    Description: Azure DevOps repository name
+    MinLength: 1
+    MaxLength: 100
+
+  BranchName:
+    Type: String
+    Description: Git branch name to build
+    Default: main
+    MinLength: 1
+    MaxLength: 100
+
+  EcrRepositoryUri:
+    Type: String
+    Description: ECR repository URI for Docker images
+    Default: ""
+
+  ApiGatewayEndpoint:
+    Type: String
+    Description: API Gateway endpoint URL for contract testing
+    Default: ""
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  HasEcrRepositoryUri: !Not [!Equals [!Ref EcrRepositoryUri, ""]]
+  HasApiGatewayEndpoint: !Not [!Equals [!Ref ApiGatewayEndpoint, ""]]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Groups for CodeBuild Projects
+  # Purpose: Centralized logging for all CodeBuild projects
+  # Requirements: 7.1 (CloudWatch Logs)
+  # ---------------------------------------------------------------------------
+  SourceProjectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-source
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-source-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LintProjectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-lint
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-lint-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  BuildProjectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-build
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-build-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PushProjectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-push
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-push-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ContractTestProjectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-contract-test
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-contract-test-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Source Stage CodeBuild Project
+  # Purpose: Clone repository from Azure DevOps using PAT authentication
+  # Requirements: 1.3 (Source stage SHALL use CodeBuild to clone repository using PAT)
+  # ---------------------------------------------------------------------------
+  SourceProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-source
+      Description: Clone repository from Azure DevOps using PAT authentication
+      ServiceRole:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: AZURE_DEVOPS_ORGANIZATION
+            Type: PLAINTEXT
+            Value: !Ref AzureDevOpsOrganization
+          - Name: AZURE_DEVOPS_PROJECT
+            Type: PLAINTEXT
+            Value: !Ref AzureDevOpsProject
+          - Name: AZURE_DEVOPS_REPOSITORY
+            Type: PLAINTEXT
+            Value: !Ref AzureDevOpsRepository
+          - Name: BRANCH_NAME
+            Type: PLAINTEXT
+            Value: !Ref BranchName
+          - Name: PROJECT_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT
+            Type: PLAINTEXT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-source.yml
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+        SecurityGroupIds:
+          - !Ref CodeBuildSecurityGroupId
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref SourceProjectLogGroup
+          StreamName: source-build
+      TimeoutInMinutes: 15
+      QueuedTimeoutInMinutes: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-source
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: Source
+
+  # ---------------------------------------------------------------------------
+  # Lint Stage CodeBuild Project
+  # Purpose: Validate OpenAPI specifications using Spectral linting
+  # Requirements: 3.1 (Pipeline SHALL include API governance stage for OpenAPI validation)
+  # ---------------------------------------------------------------------------
+  LintProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-lint
+      Description: Validate OpenAPI specifications using Spectral linting (warnings only)
+      ServiceRole:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT
+            Type: PLAINTEXT
+            Value: !Ref Environment
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-lint.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LintProjectLogGroup
+          StreamName: lint-build
+      TimeoutInMinutes: 15
+      QueuedTimeoutInMinutes: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-lint
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: Lint
+
+  # ---------------------------------------------------------------------------
+  # Build Stage CodeBuild Project
+  # Purpose: Compile .NET solution, run tests, and build Docker image
+  # Requirements: 4.1 (Build stage SHALL compile .NET 10 solution using dotnet build)
+  # ---------------------------------------------------------------------------
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-build
+      Description: Compile .NET solution, run unit tests, and build Docker image
+      ServiceRole:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT
+            Type: PLAINTEXT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: DOTNET_CLI_TELEMETRY_OPTOUT
+            Type: PLAINTEXT
+            Value: "1"
+          - Name: DOTNET_NOLOGO
+            Type: PLAINTEXT
+            Value: "1"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-build.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildProjectLogGroup
+          StreamName: build
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 60
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-build
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: Build
+
+  # ---------------------------------------------------------------------------
+  # Push Stage CodeBuild Project
+  # Purpose: Authenticate with ECR and push Docker image
+  # Requirements: 5.1 (Push stage SHALL authenticate with ECR and push Docker image)
+  # ---------------------------------------------------------------------------
+  PushProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-push
+      Description: Authenticate with ECR and push Docker image with tags
+      ServiceRole:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Ref AWS::AccountId
+          - Name: AWS_REGION
+            Type: PLAINTEXT
+            Value: !Ref AWS::Region
+          - Name: ECR_REPO
+            Type: PLAINTEXT
+            Value: !Sub ${ProjectName}-${Environment}
+          - Name: PROJECT_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT
+            Type: PLAINTEXT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-push.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref PushProjectLogGroup
+          StreamName: push
+      TimeoutInMinutes: 15
+      QueuedTimeoutInMinutes: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-push
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: Push
+
+  # ---------------------------------------------------------------------------
+  # Contract Test Stage CodeBuild Project
+  # Purpose: Run Dredd API contract testing against deployed API
+  # Requirements: 3.1 (API governance), 3.7 (Dredd contract testing)
+  # ---------------------------------------------------------------------------
+  ContractTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-contract-test
+      Description: Run Dredd API contract testing against deployed API (warnings only)
+      ServiceRole:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT
+            Type: PLAINTEXT
+            Value: !Ref Environment
+          - Name: API_GATEWAY_ENDPOINT
+            Type: PLAINTEXT
+            Value: !If [HasApiGatewayEndpoint, !Ref ApiGatewayEndpoint, ""]
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-contract-test.yml
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+        SecurityGroupIds:
+          - !Ref CodeBuildSecurityGroupId
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref ContractTestProjectLogGroup
+          StreamName: contract-test
+      TimeoutInMinutes: 20
+      QueuedTimeoutInMinutes: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-contract-test
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: ContractTest
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Source Project Outputs
+  SourceProjectName:
+    Description: Source CodeBuild Project Name
+    Value: !Ref SourceProject
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SourceProjectName
+
+  SourceProjectArn:
+    Description: Source CodeBuild Project ARN
+    Value: !GetAtt SourceProject.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SourceProjectArn
+
+  # Lint Project Outputs
+  LintProjectName:
+    Description: Lint CodeBuild Project Name
+    Value: !Ref LintProject
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LintProjectName
+
+  LintProjectArn:
+    Description: Lint CodeBuild Project ARN
+    Value: !GetAtt LintProject.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LintProjectArn
+
+  # Build Project Outputs
+  BuildProjectName:
+    Description: Build CodeBuild Project Name
+    Value: !Ref BuildProject
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BuildProjectName
+
+  BuildProjectArn:
+    Description: Build CodeBuild Project ARN
+    Value: !GetAtt BuildProject.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BuildProjectArn
+
+  # Push Project Outputs
+  PushProjectName:
+    Description: Push CodeBuild Project Name
+    Value: !Ref PushProject
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PushProjectName
+
+  PushProjectArn:
+    Description: Push CodeBuild Project ARN
+    Value: !GetAtt PushProject.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PushProjectArn
+
+  # Contract Test Project Outputs
+  ContractTestProjectName:
+    Description: Contract Test CodeBuild Project Name
+    Value: !Ref ContractTestProject
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContractTestProjectName
+
+  ContractTestProjectArn:
+    Description: Contract Test CodeBuild Project ARN
+    Value: !GetAtt ContractTestProject.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContractTestProjectArn
+
+  # Log Group Outputs
+  SourceProjectLogGroupName:
+    Description: Source Project CloudWatch Log Group Name
+    Value: !Ref SourceProjectLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SourceProjectLogGroupName
+
+  LintProjectLogGroupName:
+    Description: Lint Project CloudWatch Log Group Name
+    Value: !Ref LintProjectLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LintProjectLogGroupName
+
+  BuildProjectLogGroupName:
+    Description: Build Project CloudWatch Log Group Name
+    Value: !Ref BuildProjectLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-BuildProjectLogGroupName
+
+  PushProjectLogGroupName:
+    Description: Push Project CloudWatch Log Group Name
+    Value: !Ref PushProjectLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PushProjectLogGroupName
+
+  ContractTestProjectLogGroupName:
+    Description: Contract Test Project CloudWatch Log Group Name
+    Value: !Ref ContractTestProjectLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContractTestProjectLogGroupName
