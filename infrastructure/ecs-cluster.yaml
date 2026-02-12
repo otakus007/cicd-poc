@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECS Cluster Stack for CI/CD Pipeline.
+  Creates an ECS Fargate cluster with Container Insights enabled for monitoring,
+  capacity providers (FARGATE and FARGATE_SPOT), and default capacity provider strategy.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Cluster Configuration"
+        Parameters:
+          - ContainerInsightsEnabled
+          - FargateWeight
+          - FargateSpotWeight
+          - FargateBase
+      - Label:
+          default: "Cost Tracking Configuration"
+        Parameters:
+          - ComputeType
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      ContainerInsightsEnabled:
+        default: "Enable Container Insights"
+      FargateWeight:
+        default: "Fargate Capacity Weight"
+      FargateSpotWeight:
+        default: "Fargate Spot Capacity Weight"
+      FargateBase:
+        default: "Fargate Base Capacity"
+      ComputeType:
+        default: "Compute Type for Cost Tracking"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  ContainerInsightsEnabled:
+    Type: String
+    Description: Enable Container Insights for monitoring (enabled/disabled)
+    Default: enabled
+    AllowedValues:
+      - enabled
+      - disabled
+    ConstraintDescription: Must be enabled or disabled
+
+  FargateWeight:
+    Type: Number
+    Description: Weight for FARGATE capacity provider in default strategy
+    Default: 1
+    MinValue: 0
+    MaxValue: 1000
+    ConstraintDescription: Must be between 0 and 1000
+
+  FargateSpotWeight:
+    Type: Number
+    Description: Weight for FARGATE_SPOT capacity provider in default strategy
+    Default: 4
+    MinValue: 0
+    MaxValue: 1000
+    ConstraintDescription: Must be between 0 and 1000
+
+  FargateBase:
+    Type: Number
+    Description: Base number of tasks to run on FARGATE (non-spot) capacity
+    Default: 1
+    MinValue: 0
+    MaxValue: 100000
+    ConstraintDescription: Must be between 0 and 100000
+
+  ComputeType:
+    Type: String
+    Description: Compute type for cost allocation tagging (fargate or ec2)
+    Default: fargate
+    AllowedValues:
+      - fargate
+      - ec2
+    ConstraintDescription: Must be fargate or ec2
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # ECS Cluster with Fargate Launch Type
+  # Requirement 6.2: ECS_Fargate SHALL perform a rolling deployment
+  # Requirement 7.1: Pipeline SHALL log all stage transitions and execution
+  #                  details to CloudWatch Logs (Container Insights enabled)
+  # ---------------------------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-${Environment}-cluster
+      ClusterSettings:
+        # Enable Container Insights for monitoring
+        # This provides detailed metrics and logs for ECS tasks
+        - Name: containerInsights
+          Value: !Ref ContainerInsightsEnabled
+      # Configure capacity providers for Fargate and Fargate Spot
+      # FARGATE: On-demand capacity for reliable, consistent performance
+      # FARGATE_SPOT: Cost-optimized capacity using spare AWS capacity
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      # Default capacity provider strategy
+      # Base: Minimum number of tasks on FARGATE (non-spot)
+      # Weight: Relative proportion of tasks on each provider
+      # With Base=1, Weight=1 for FARGATE and Weight=4 for FARGATE_SPOT:
+      # - First task always runs on FARGATE
+      # - Additional tasks split 1:4 between FARGATE and FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: !Ref FargateWeight
+          Base: !Ref FargateBase
+        - CapacityProvider: FARGATE_SPOT
+          Weight: !Ref FargateSpotWeight
+          Base: 0
+      # Service Connect defaults for service mesh capabilities
+      ServiceConnectDefaults:
+        Namespace: !Sub ${ProjectName}-${Environment}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-cluster
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS Fargate Cluster for API Services
+        - Key: ManagedBy
+          Value: CloudFormation
+        # Requirement 3.2: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for ECS Container Logs
+  # Requirement 7.1: Pipeline SHALL log all stage transitions and execution
+  #                  details to CloudWatch Logs
+  # ---------------------------------------------------------------------------
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}
+      RetentionInDays: !If
+        - IsProduction
+        - 90
+        - !If
+          - IsStaging
+          - 30
+          - 14
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS Container Logs
+        # Requirement 3.2: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for Container Insights Performance Logs
+  # Provides detailed performance metrics when Container Insights is enabled
+  # ---------------------------------------------------------------------------
+  ContainerInsightsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ecs/containerinsights/${ProjectName}-${Environment}-cluster/performance
+      RetentionInDays: !If
+        - IsProduction
+        - 90
+        - !If
+          - IsStaging
+          - 30
+          - 14
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-container-insights-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Container Insights Performance Logs
+        # Requirement 3.2: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Cluster Outputs
+  ClusterArn:
+    Description: ECS Cluster ARN
+    Value: !GetAtt EcsCluster.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsClusterArn
+
+  ClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsClusterName
+
+  ClusterId:
+    Description: ECS Cluster ID (same as name for ECS clusters)
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsClusterId
+
+  # Capacity Provider Information
+  DefaultCapacityProviders:
+    Description: List of capacity providers configured for the cluster
+    Value: FARGATE,FARGATE_SPOT
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsCapacityProviders
+
+  FargateCapacityWeight:
+    Description: Weight assigned to FARGATE capacity provider
+    Value: !Ref FargateWeight
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-FargateWeight
+
+  FargateSpotCapacityWeight:
+    Description: Weight assigned to FARGATE_SPOT capacity provider
+    Value: !Ref FargateSpotWeight
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-FargateSpotWeight
+
+  FargateBaseCapacity:
+    Description: Base capacity for FARGATE provider
+    Value: !Ref FargateBase
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-FargateBase
+
+  # Container Insights Status
+  ContainerInsightsStatus:
+    Description: Container Insights enabled status
+    Value: !Ref ContainerInsightsEnabled
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContainerInsightsStatus
+
+  # Log Group Outputs
+  EcsLogGroupArn:
+    Description: CloudWatch Log Group ARN for ECS container logs
+    Value: !GetAtt EcsLogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsLogGroupArn
+
+  EcsLogGroupName:
+    Description: CloudWatch Log Group Name for ECS container logs
+    Value: !Ref EcsLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsLogGroupName
+
+  ContainerInsightsLogGroupArn:
+    Description: CloudWatch Log Group ARN for Container Insights performance logs
+    Value: !GetAtt ContainerInsightsLogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContainerInsightsLogGroupArn
+
+  ContainerInsightsLogGroupName:
+    Description: CloudWatch Log Group Name for Container Insights performance logs
+    Value: !Ref ContainerInsightsLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContainerInsightsLogGroupName
+
+  # Service Connect Namespace
+  ServiceConnectNamespace:
+    Description: Service Connect default namespace
+    Value: !Sub ${ProjectName}-${Environment}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ServiceConnectNamespace
