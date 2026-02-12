@@ -1,0 +1,508 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CodePipeline Stack for CI/CD Pipeline.
+  Creates a 6-stage pipeline: Source, Lint, Build, Push, Deploy, ContractTest.
+  Integrates with Azure DevOps via webhook trigger and deploys to ECS Fargate.
+  Requirements: 1.4 (webhook trigger), 1.5 (pipeline stages)
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "IAM Configuration"
+        Parameters:
+          - CodePipelineRoleArn
+      - Label:
+          default: "CodeBuild Projects"
+        Parameters:
+          - SourceProjectName
+          - LintProjectName
+          - BuildProjectName
+          - PushProjectName
+          - ContractTestProjectName
+      - Label:
+          default: "ECS Configuration"
+        Parameters:
+          - ClusterName
+          - ServiceName
+      - Label:
+          default: "Monitoring"
+        Parameters:
+          - NotificationTopicArn
+      - Label:
+          default: "Branch Configuration"
+        Parameters:
+          - BranchName
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      CodePipelineRoleArn:
+        default: "CodePipeline IAM Role ARN"
+      SourceProjectName:
+        default: "Source CodeBuild Project"
+      LintProjectName:
+        default: "Lint CodeBuild Project"
+      BuildProjectName:
+        default: "Build CodeBuild Project"
+      PushProjectName:
+        default: "Push CodeBuild Project"
+      ContractTestProjectName:
+        default: "Contract Test CodeBuild Project"
+      ClusterName:
+        default: "ECS Cluster Name"
+      ServiceName:
+        default: "ECS Service Name"
+      NotificationTopicArn:
+        default: "SNS Notification Topic ARN"
+      BranchName:
+        default: "Git Branch Name"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  # IAM Role ARN for CodePipeline
+  CodePipelineRoleArn:
+    Type: String
+    Description: ARN of the IAM role for CodePipeline
+
+  # CodeBuild Project Names (passed from CodeBuildStack outputs)
+  SourceProjectName:
+    Type: String
+    Description: Name of the CodeBuild Source project
+
+  LintProjectName:
+    Type: String
+    Description: Name of the CodeBuild Lint project
+
+  BuildProjectName:
+    Type: String
+    Description: Name of the CodeBuild Build project
+
+  PushProjectName:
+    Type: String
+    Description: Name of the CodeBuild Push project
+
+  ContractTestProjectName:
+    Type: String
+    Description: Name of the CodeBuild Contract Test project
+
+  # ECS Configuration
+  ClusterName:
+    Type: String
+    Description: Name of the ECS Cluster for deployment
+
+  ServiceName:
+    Type: String
+    Description: Name of the ECS Service for deployment
+
+  # Monitoring
+  NotificationTopicArn:
+    Type: String
+    Description: ARN of the SNS notification topic
+
+  # Branch
+  BranchName:
+    Type: String
+    Description: Git branch name for pipeline
+    Default: main
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 Artifact Bucket
+  # Purpose: Stores pipeline artifacts between stages
+  # Requirements: Pipeline artifact storage for stage transitions
+  # ---------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-pipeline-artifacts-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-pipeline-artifacts
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Pipeline Artifact Storage
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket Policy
+  # Purpose: Allows CodePipeline and CodeBuild to access artifacts
+  # ---------------------------------------------------------------------------
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowPipelineAccess
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Ref CodePipelineRoleArn
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub ${ArtifactBucket.Arn}/*
+          - Sid: AllowBucketAccess
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Ref CodePipelineRoleArn
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+              - s3:ListBucket
+            Resource: !GetAtt ArtifactBucket.Arn
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # CodePipeline
+  # Purpose: Orchestrates the 6-stage CI/CD workflow
+  # Stages: Source, Lint, Build, Push, Deploy, ContractTest
+  # Requirement 1.4: Pipeline SHALL be triggered by webhook from Azure DevOps
+  # Requirement 1.5: Pipeline SHALL have stages: Source, Lint, Build, Push, Deploy, ContractTest
+  # ---------------------------------------------------------------------------
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-pipeline
+      RoleArn: !Ref CodePipelineRoleArn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      RestartExecutionOnUpdate: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-pipeline
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CI/CD Pipeline
+      Stages:
+        # =====================================================================
+        # Stage 1: Source
+        # Purpose: Use S3 trigger as the pipeline source action.
+        # CodePipeline requires the first stage to contain only Source actions.
+        # The webhook from Azure DevOps uploads a trigger.zip to S3 which
+        # starts the pipeline. The actual repo clone happens in Stage 2.
+        # =====================================================================
+        - Name: Source
+          Actions:
+            - Name: S3Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: trigger/trigger.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: TriggerOutput
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+        # =====================================================================
+        # Stage 2: CloneSource
+        # Purpose: Clone repository from Azure DevOps using PAT authentication
+        # Uses CodeBuild to git clone the repo with PAT credentials
+        # Output: SourceOutput artifact containing repository code
+        # =====================================================================
+        - Name: CloneSource
+          Actions:
+            - Name: CloneRepository
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SourceProjectName
+              InputArtifacts:
+                - Name: TriggerOutput
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+        # =====================================================================
+        # Stage 3: Lint
+        # Purpose: Validate OpenAPI specifications using Spectral
+        # Input: SourceOutput from CloneSource stage
+        # Output: LintOutput with governance reports (warnings only)
+        # Note: All linting issues are reported as warnings, build never fails
+        # =====================================================================
+        - Name: Lint
+          Actions:
+            - Name: APIGovernance
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref LintProjectName
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: LintOutput
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+        # =====================================================================
+        # Stage 3: Build
+        # Purpose: Compile .NET solution, run tests, build Docker image
+        # Input: SourceOutput from Source stage
+        # Output: BuildOutput with compiled artifacts and Docker image
+        # =====================================================================
+        - Name: Build
+          Actions:
+            - Name: BuildAndTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref BuildProjectName
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+        # =====================================================================
+        # Stage 4: Push
+        # Purpose: Push Docker image to ECR with tags
+        # Input: BuildOutput from Build stage
+        # Output: PushOutput with imageDetail.json containing image URI
+        # =====================================================================
+        - Name: Push
+          Actions:
+            - Name: PushToECR
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref PushProjectName
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: PushOutput
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+        # =====================================================================
+        # Stage 5: Deploy
+        # Purpose: Deploy new image to ECS Fargate service
+        # Input: PushOutput with imageDetail.json
+        # Action: ECS rolling deployment with circuit breaker
+        # Requirement 6.2: Rolling deployment when task definition is updated
+        # Requirement 6.4: Automatic rollback on health check failure
+        # =====================================================================
+        - Name: Deploy
+          Actions:
+            - Name: DeployToECS
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: "1"
+              Configuration:
+                ClusterName: !Ref ClusterName
+                ServiceName: !Ref ServiceName
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: PushOutput
+              OutputArtifacts: []
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+        # =====================================================================
+        # Stage 6: ContractTest
+        # Purpose: Run Dredd API contract testing against deployed API
+        # Input: SourceOutput (for OpenAPI spec and Dredd config)
+        # Output: ContractTestOutput with test reports (warnings only)
+        # Note: All contract violations are reported as warnings, build never fails
+        # Requirement 3.7: Dredd contract testing after deployment
+        # =====================================================================
+        - Name: ContractTest
+          Actions:
+            - Name: DreddContractTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref ContractTestProjectName
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: ContractTestOutput
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+  # ---------------------------------------------------------------------------
+  # Pipeline CloudWatch Log Group
+  # Purpose: Centralized logging for pipeline execution
+  # Requirement 7.1: Pipeline SHALL log all stage transitions to CloudWatch
+  # ---------------------------------------------------------------------------
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codepipeline/${ProjectName}-${Environment}
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-pipeline-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Pipeline Outputs
+  PipelineName:
+    Description: CodePipeline Name
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineName
+
+  PipelineArn:
+    Description: CodePipeline ARN
+    Value: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineArn
+
+  PipelineUrl:
+    Description: CodePipeline Console URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineUrl
+
+  # Artifact Bucket Outputs
+  ArtifactBucketName:
+    Description: S3 Artifact Bucket Name
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ArtifactBucketName
+
+  ArtifactBucketArn:
+    Description: S3 Artifact Bucket ARN
+    Value: !GetAtt ArtifactBucket.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ArtifactBucketArn
+
+  # Log Group Outputs
+  PipelineLogGroupName:
+    Description: Pipeline CloudWatch Log Group Name
+    Value: !Ref PipelineLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineLogGroupName
+
+  PipelineLogGroupArn:
+    Description: Pipeline CloudWatch Log Group ARN
+    Value: !GetAtt PipelineLogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineLogGroupArn
+
+  # Pipeline Stage Summary
+  PipelineStages:
+    Description: Summary of pipeline stages
+    Value: "Source -> CloneSource -> Lint -> Build -> Push -> Deploy -> ContractTest"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineStages
+
+  # Configuration Summary
+  PipelineConfigurationSummary:
+    Description: Summary of pipeline configuration
+    Value: !Sub |
+      Pipeline: ${ProjectName}-${Environment}-pipeline
+      Stages: Source, CloneSource, Lint, Build, Push, Deploy, ContractTest
+      Artifact Bucket: ${ArtifactBucket}
+      ECS Cluster: ${ClusterName}
+      ECS Service: ${ServiceName}
+      Log Group: /aws/codepipeline/${ProjectName}-${Environment}
+
