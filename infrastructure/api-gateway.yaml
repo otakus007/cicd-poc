@@ -1,0 +1,563 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  API Gateway Stack for CI/CD Pipeline.
+  Creates an HTTP API Gateway with VPC Link for private ALB integration,
+  throttling limits, and CORS configuration. Supports HTTPS-only with TLS 1.2+.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - PrivateSubnet1Id
+          - PrivateSubnet2Id
+          - VpcLinkSecurityGroupId
+      - Label:
+          default: "ALB Integration"
+        Parameters:
+          - AlbListenerArn
+          - AlbDnsName
+      - Label:
+          default: "Throttling Configuration"
+        Parameters:
+          - ThrottlingBurstLimit
+          - ThrottlingRateLimit
+      - Label:
+          default: "CORS Configuration"
+        Parameters:
+          - CorsAllowOrigins
+          - CorsMaxAge
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      VpcId:
+        default: "VPC ID"
+      PrivateSubnet1Id:
+        default: "Private Subnet 1 ID"
+      PrivateSubnet2Id:
+        default: "Private Subnet 2 ID"
+      VpcLinkSecurityGroupId:
+        default: "VPC Link Security Group ID"
+      AlbListenerArn:
+        default: "ALB Listener ARN"
+      AlbDnsName:
+        default: "ALB DNS Name"
+      ThrottlingBurstLimit:
+        default: "Throttling Burst Limit"
+      ThrottlingRateLimit:
+        default: "Throttling Rate Limit"
+      CorsAllowOrigins:
+        default: "CORS Allowed Origins"
+      CorsMaxAge:
+        default: "CORS Max Age (seconds)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the VPC Link will be created
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet 1 ID for VPC Link (AZ-a)
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet 2 ID for VPC Link (AZ-b)
+
+  VpcLinkSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID for the VPC Link
+
+  AlbListenerArn:
+    Type: String
+    Description: ARN of the ALB HTTPS Listener for integration
+    AllowedPattern: ^arn:aws:elasticloadbalancing:.*$
+    ConstraintDescription: Must be a valid ALB Listener ARN
+
+  AlbDnsName:
+    Type: String
+    Description: DNS name of the internal ALB
+    AllowedPattern: ^[a-zA-Z0-9.-]+$
+    ConstraintDescription: Must be a valid DNS name
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Description: Maximum number of requests that can be made in a burst
+    Default: 1000
+    MinValue: 0
+    MaxValue: 10000
+    ConstraintDescription: Must be between 0 and 10000
+
+  ThrottlingRateLimit:
+    Type: Number
+    Description: Maximum number of requests per second
+    Default: 500
+    MinValue: 0
+    MaxValue: 10000
+    ConstraintDescription: Must be between 0 and 10000
+
+  CorsAllowOrigins:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of allowed CORS origins
+    Default: "*"
+
+  CorsMaxAge:
+    Type: Number
+    Description: Maximum time (in seconds) that browsers can cache CORS preflight responses
+    Default: 3600
+    MinValue: 0
+    MaxValue: 86400
+    ConstraintDescription: Must be between 0 and 86400 seconds
+
+  CustomDomainName:
+    Type: String
+    Description: Custom domain name for the API Gateway. Leave empty to skip.
+    Default: ""
+
+  CertificateArn:
+    Type: String
+    Description: ACM Certificate ARN for the custom domain.
+    Default: ""
+
+  PipelineName:
+    Type: String
+    Description: (Deprecated) Single pipeline name - use /webhook/{service} path instead
+    Default: ""
+
+  PipelineArn:
+    Type: String
+    Description: (Deprecated) Single pipeline ARN - webhook now supports multiple pipelines
+    Default: ""
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  # Webhook is always enabled - supports multiple pipelines via /webhook/{service}
+  EnableWebhook: !Equals ["true", "true"]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # HTTP API Gateway
+  # Requirement 2.1: API Gateway configured as HTTP API type for REST endpoint routing
+  # Requirement 2.6: Supports HTTPS-only connections with TLS 1.2 or higher
+  # ---------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-api-gateway
+      Description: !Sub HTTP API Gateway for ${ProjectName} ${Environment} environment
+      ProtocolType: HTTP
+      DisableExecuteApiEndpoint: false
+      CorsConfiguration:
+        AllowOrigins: !Ref CorsAllowOrigins
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+          - HEAD
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Request-Id
+          - X-Amz-Date
+          - X-Api-Key
+          - X-Amz-Security-Token
+        ExposeHeaders:
+          - X-Request-Id
+          - X-Amzn-RequestId
+          - X-Amzn-Trace-Id
+        MaxAge: !Ref CorsMaxAge
+        AllowCredentials: false
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: HTTP API Gateway
+
+  # ---------------------------------------------------------------------------
+  # VPC Link for Private ALB Integration
+  # Requirement 2.2: API Gateway connects to internal ALB via VPC Link
+  # ---------------------------------------------------------------------------
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-vpc-link
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      SecurityGroupIds:
+        - !Ref VpcLinkSecurityGroupId
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: VPC Link for ALB Integration
+
+  # ---------------------------------------------------------------------------
+  # Integration with Internal ALB
+  # Routes all requests through VPC Link to the internal ALB
+  # Requirement 2.7: Forwards requests with appropriate headers (X-Forwarded-For, X-Request-Id)
+  # ---------------------------------------------------------------------------
+  AlbIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      Description: Integration with internal ALB via VPC Link
+      IntegrationType: HTTP_PROXY
+      IntegrationUri: !Ref AlbListenerArn
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      PayloadFormatVersion: "1.0"
+      TimeoutInMillis: 30000
+      RequestParameters:
+        # Generate unique request ID if not provided by client
+        overwrite:header.X-Request-Id: "$context.requestId"
+
+  # ---------------------------------------------------------------------------
+  # Default Route (Catch-All)
+  # Routes all requests to the ALB integration
+  # ---------------------------------------------------------------------------
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub integrations/${AlbIntegration}
+
+  # ---------------------------------------------------------------------------
+  # API Routes for specific paths
+  # ---------------------------------------------------------------------------
+  # Route for /api/* endpoints
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /api/{proxy+}
+      Target: !Sub integrations/${AlbIntegration}
+
+  # Route for /health endpoint
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /health
+      Target: !Sub integrations/${AlbIntegration}
+
+  # ---------------------------------------------------------------------------
+  # API Stage with Throttling
+  # Requirement 2.4: Validates requests against configured throttling limits
+  # Requirement 2.5: Returns HTTP 429 when throttling limits exceeded
+  # ---------------------------------------------------------------------------
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn:
+      - DefaultRoute
+      - ApiRoute
+      - HealthRoute
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      Description: !Sub Default stage for ${ProjectName} ${Environment} API
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+        ThrottlingRateLimit: !Ref ThrottlingRateLimit
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","extendedRequestId":"$context.extendedRequestId","ip":"$context.identity.sourceIp","userAgent":"$context.identity.userAgent","requestTime":"$context.requestTime","requestTimeEpoch":"$context.requestTimeEpoch","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","responseLatency":"$context.responseLatency","integrationStatus":"$context.integrationStatus","integrationErrorMessage":"$context.integrationErrorMessage","errorMessage":"$context.error.message","errorResponseType":"$context.error.responseType"}'
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: API Stage
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for API Gateway Access Logs
+  # ---------------------------------------------------------------------------
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${ProjectName}-${Environment}-api-gateway
+      RetentionInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: API Gateway Access Logs
+
+  # ---------------------------------------------------------------------------
+  # Custom Domain Name (Optional - for production use)
+  # Supports HTTPS-only with TLS 1.2 minimum
+  # ---------------------------------------------------------------------------
+  # Note: Uncomment and configure when a custom domain is required
+  # CustomDomainName:
+  #   Type: AWS::ApiGatewayV2::DomainName
+  #   Properties:
+  #     DomainName: !Sub api.${ProjectName}.example.com
+  #     DomainNameConfigurations:
+  #       - CertificateArn: !Ref ApiCertificateArn
+  #         EndpointType: REGIONAL
+  #         SecurityPolicy: TLS_1_2
+  #     Tags:
+  #       Environment: !Ref Environment
+  #       Project: !Ref ProjectName
+
+  # ApiMapping:
+  #   Type: AWS::ApiGatewayV2::ApiMapping
+  #   DependsOn: ApiStage
+  #   Properties:
+  #     ApiId: !Ref HttpApi
+  #     DomainName: !Ref CustomDomainName
+  #     Stage: $default
+
+  # ---------------------------------------------------------------------------
+  # Webhook Lambda for Azure DevOps Pipeline Trigger
+  # Receives POST /webhook/{service} and starts the corresponding CodePipeline
+  # ---------------------------------------------------------------------------
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: EnableWebhook
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-webhook-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodePipelineStartExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-*-pipeline
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-webhook-lambda-role
+        - Key: Environment
+          Value: !Ref Environment
+
+  WebhookLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableWebhook
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-webhook-handler
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json,os,boto3,logging
+          logger=logging.getLogger()
+          logger.setLevel(logging.INFO)
+          cp=boto3.client('codepipeline')
+          def handler(e,c):
+            try:
+              # Get service name from path parameter
+              pp=e.get('pathParameters',{}) or {}
+              svc=pp.get('service','')
+              if not svc:
+                return{'statusCode':400,'body':json.dumps({'error':'Missing service in path. Use /webhook/{service}'})}
+              
+              # Check event type from Azure DevOps headers
+              h=e.get('headers',{})
+              et=h.get('x-azure-devops-event',h.get('X-Azure-DevOps-Event',''))
+              logger.info(f"Webhook received: service={svc}, event={et}")
+              
+              if et and et not in['git.push','code.push']:
+                return{'statusCode':200,'body':json.dumps({'message':f'Event {et} ignored'})}
+              
+              # Build pipeline name and trigger
+              pn=f"{os.environ['PROJECT_NAME']}-{os.environ['ENVIRONMENT']}-{svc}-pipeline"
+              r=cp.start_pipeline_execution(name=pn)
+              logger.info(f"Triggered pipeline {pn}: {r['pipelineExecutionId']}")
+              
+              return{'statusCode':200,'body':json.dumps({'success':True,'pipeline':pn,'executionId':r['pipelineExecutionId']})}
+            except cp.exceptions.PipelineNotFoundException:
+              return{'statusCode':404,'body':json.dumps({'error':f'Pipeline not found for service: {svc}'})}
+            except Exception as x:
+              logger.error(str(x))
+              return{'statusCode':500,'body':json.dumps({'error':str(x)})}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-webhook-handler
+        - Key: Environment
+          Value: !Ref Environment
+
+  WebhookLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableWebhook
+    Properties:
+      FunctionName: !Ref WebhookLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*
+
+  WebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: EnableWebhook
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebhookLambdaFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  WebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: EnableWebhook
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /webhook/{service}
+      Target: !Sub integrations/${WebhookIntegration}
+
+  WebhookLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableWebhook
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-${Environment}-webhook-handler
+      RetentionInDays: 30
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # API Gateway Outputs
+  ApiGatewayId:
+    Description: HTTP API Gateway ID
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiGatewayId
+
+  ApiGatewayEndpoint:
+    Description: HTTP API Gateway Endpoint URL (HTTPS)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiGatewayEndpoint
+
+  ApiGatewayArn:
+    Description: HTTP API Gateway ARN
+    Value: !Sub arn:aws:apigateway:${AWS::Region}::/apis/${HttpApi}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiGatewayArn
+
+  # VPC Link Outputs
+  VpcLinkId:
+    Description: VPC Link ID
+    Value: !Ref VpcLink
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-VpcLinkId
+
+  VpcLinkArn:
+    Description: VPC Link ARN
+    Value: !Sub arn:aws:apigateway:${AWS::Region}::/vpclinks/${VpcLink}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-VpcLinkArn
+
+  # Integration Outputs
+  AlbIntegrationId:
+    Description: ALB Integration ID
+    Value: !Ref AlbIntegration
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbIntegrationId
+
+  # Stage Outputs
+  ApiStageId:
+    Description: API Stage ID
+    Value: !Ref ApiStage
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiStageId
+
+  # Log Group Outputs
+  ApiGatewayLogGroupArn:
+    Description: API Gateway CloudWatch Log Group ARN
+    Value: !GetAtt ApiGatewayLogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiGatewayLogGroupArn
+
+  ApiGatewayLogGroupName:
+    Description: API Gateway CloudWatch Log Group Name
+    Value: !Ref ApiGatewayLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiGatewayLogGroupName
+
+  # Throttling Configuration Outputs
+  ThrottlingBurstLimit:
+    Description: Configured Throttling Burst Limit
+    Value: !Ref ThrottlingBurstLimit
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ThrottlingBurstLimit
+
+  ThrottlingRateLimit:
+    Description: Configured Throttling Rate Limit (requests/second)
+    Value: !Ref ThrottlingRateLimit
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ThrottlingRateLimit
+
+  # Webhook Outputs
+  WebhookUrl:
+    Description: Webhook URL pattern for Azure DevOps integration
+    Condition: EnableWebhook
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/webhook/{service}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-WebhookUrl
+
+  WebhookLambdaArn:
+    Description: Webhook Lambda Function ARN
+    Condition: EnableWebhook
+    Value: !GetAtt WebhookLambdaFunction.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-WebhookLambdaArn
+
