@@ -1,0 +1,568 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Monitoring and Notifications Stack for CI/CD Pipeline.
+  Creates SNS topic, CloudWatch Events rules, webhook configuration, and Dashboard.
+  Requirements: 1.4 (webhook trigger), 1.6 (failure notifications), 7.2 (stage failure notifications)
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Pipeline Configuration"
+        Parameters:
+          - PipelineName
+          - PipelineArn
+          - ClusterName
+      - Label:
+          default: "ECS Service Configuration"
+        Parameters:
+          - ServiceName
+      - Label:
+          default: "Load Balancer Configuration"
+        Parameters:
+          - LoadBalancerFullName
+          - TargetGroupFullName
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableSuccessNotifications
+      - Label:
+          default: "Alarm Configuration"
+        Parameters:
+          - AlarmEvaluationPeriods
+          - PipelineFailureThreshold
+          - EcsCpuThreshold
+          - EcsMemoryThreshold
+          - UnhealthyHostThreshold
+          - ResponseTimeThreshold
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  ProjectName:
+    Type: String
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+  PipelineName:
+    Type: String
+    Default: ""
+  PipelineArn:
+    Type: String
+    Default: ""
+  ClusterName:
+    Type: String
+    Default: ""
+  NotificationEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+  EnableSuccessNotifications:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  ServiceName:
+    Type: String
+    Default: ""
+  LoadBalancerFullName:
+    Type: String
+    Default: ""
+  TargetGroupFullName:
+    Type: String
+    Default: ""
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+  PipelineFailureThreshold:
+    Type: Number
+    Default: 1
+    MinValue: 1
+  EcsCpuThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+  EcsMemoryThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+  UnhealthyHostThreshold:
+    Type: Number
+    Default: 1
+    MinValue: 1
+  ResponseTimeThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+
+Conditions:
+  HasPipelineName: !Not [!Equals [!Ref PipelineName, ""]]
+  HasPipelineArn: !Not [!Equals [!Ref PipelineArn, ""]]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  HasClusterName: !Not [!Equals [!Ref ClusterName, ""]]
+  HasServiceName: !Not [!Equals [!Ref ServiceName, ""]]
+  HasLoadBalancerFullName: !Not [!Equals [!Ref LoadBalancerFullName, ""]]
+  HasTargetGroupFullName: !Not [!Equals [!Ref TargetGroupFullName, ""]]
+  CanCreateEcsAlarms: !And
+    - !Condition HasClusterName
+    - !Condition HasServiceName
+  CanCreateAlbAlarms: !And
+    - !Condition HasLoadBalancerFullName
+    - !Condition HasTargetGroupFullName
+
+Resources:
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Environment}-pipeline-notifications
+      DisplayName: !Sub "${ProjectName} ${Environment} Pipeline Notifications"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-pipeline-notifications
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PipelineNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref PipelineNotificationTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchEventsPublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PipelineNotificationTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}-${Environment}-*
+          - Sid: AllowCodePipelinePublish
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PipelineNotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowCodeStarNotificationsPublish
+            Effect: Allow
+            Principal:
+              Service: codestar-notifications.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PipelineNotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref PipelineNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  PipelineStateChangeRule:
+    Type: AWS::Events::Rule
+    Condition: HasPipelineName
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-pipeline-state-change
+      Description: !Sub "Captures ${ProjectName} ${Environment} pipeline execution state changes"
+      State: ENABLED
+      EventPattern:
+        source: [aws.codepipeline]
+        detail-type: [CodePipeline Pipeline Execution State Change]
+        detail:
+          pipeline:
+            - !If [
+                HasPipelineName,
+                !Ref PipelineName,
+                !Sub "${ProjectName}-${Environment}-pipeline",
+              ]
+          state: [FAILED, SUCCEEDED, CANCELED, SUPERSEDED]
+      Targets:
+        - Id: SendToSNS
+          Arn: !Ref PipelineNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              pipeline: "$.detail.pipeline"
+              state: "$.detail.state"
+              executionId: "$.detail.execution-id"
+              time: "$.time"
+              region: "$.region"
+            InputTemplate: '{"type":"PIPELINE_STATE_CHANGE","pipeline":"<pipeline>","state":"<state>","executionId":"<executionId>","timestamp":"<time>","region":"<region>"}'
+
+  PipelineStageFailureRule:
+    Type: AWS::Events::Rule
+    Condition: HasPipelineName
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-pipeline-stage-failure
+      Description: !Sub "Captures ${ProjectName} ${Environment} pipeline stage failures"
+      State: ENABLED
+      EventPattern:
+        source: [aws.codepipeline]
+        detail-type: [CodePipeline Stage Execution State Change]
+        detail:
+          pipeline:
+            - !If [
+                HasPipelineName,
+                !Ref PipelineName,
+                !Sub "${ProjectName}-${Environment}-pipeline",
+              ]
+          state: [FAILED]
+      Targets:
+        - Id: SendStageFailureToSNS
+          Arn: !Ref PipelineNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              pipeline: "$.detail.pipeline"
+              stage: "$.detail.stage"
+              executionId: "$.detail.execution-id"
+              time: "$.time"
+            InputTemplate: '{"type":"STAGE_FAILURE","pipeline":"<pipeline>","stage":"<stage>","executionId":"<executionId>","timestamp":"<time>"}'
+
+  PipelineActionFailureRule:
+    Type: AWS::Events::Rule
+    Condition: HasPipelineName
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-pipeline-action-failure
+      Description: !Sub "Captures ${ProjectName} ${Environment} pipeline action failures"
+      State: ENABLED
+      EventPattern:
+        source: [aws.codepipeline]
+        detail-type: [CodePipeline Action Execution State Change]
+        detail:
+          pipeline:
+            - !If [
+                HasPipelineName,
+                !Ref PipelineName,
+                !Sub "${ProjectName}-${Environment}-pipeline",
+              ]
+          state: [FAILED]
+      Targets:
+        - Id: SendActionFailureToSNS
+          Arn: !Ref PipelineNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              pipeline: "$.detail.pipeline"
+              stage: "$.detail.stage"
+              action: "$.detail.action"
+              executionId: "$.detail.execution-id"
+            InputTemplate: '{"type":"ACTION_FAILURE","pipeline":"<pipeline>","stage":"<stage>","action":"<action>","executionId":"<executionId>"}'
+
+  PipelineWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Condition: HasPipelineName
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-azure-devops-webhook
+      Authentication: UNAUTHENTICATED
+      AuthenticationConfiguration: {}
+      Filters:
+        - JsonPath: "$.resource.refUpdates[0].name"
+          MatchEquals: "refs/heads/{Branch}"
+      TargetPipeline:
+        !If [
+          HasPipelineName,
+          !Ref PipelineName,
+          !Sub "${ProjectName}-${Environment}-pipeline",
+        ]
+      TargetAction: CloneRepository
+      TargetPipelineVersion: 1
+      RegisterWithThirdParty: false
+
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-${Environment}-pipeline-dashboard
+      DashboardBody: !Sub |
+        {"widgets":[{"type":"text","x":0,"y":0,"width":24,"height":1,"properties":{"markdown":"# ${ProjectName} ${Environment} Platform Dashboard"}},{"type":"metric","x":0,"y":1,"width":12,"height":6,"properties":{"title":"ECS Cluster CPU Utilization","view":"timeSeries","region":"${AWS::Region}","metrics":[["AWS/ECS","CPUUtilization","ClusterName","${ClusterName}"]],"period":300}},{"type":"metric","x":12,"y":1,"width":12,"height":6,"properties":{"title":"ECS Cluster Memory Utilization","view":"timeSeries","region":"${AWS::Region}","metrics":[["AWS/ECS","MemoryUtilization","ClusterName","${ClusterName}"]],"period":300}}]}
+
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasPipelineName
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-pipeline-failure-alarm
+      AlarmDescription: !Sub "Alarm when ${ProjectName} ${Environment} pipeline failures exceed threshold"
+      Namespace: AWS/CodePipeline
+      MetricName: FailedPipeline
+      Dimensions:
+        - Name: PipelineName
+          Value:
+            !If [
+              HasPipelineName,
+              !Ref PipelineName,
+              !Sub "${ProjectName}-${Environment}-pipeline",
+            ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref PipelineFailureThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineNotificationTopic]
+      OKActions: [!Ref PipelineNotificationTopic]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-pipeline-failure-alarm
+        - Key: Environment
+          Value: !Ref Environment
+
+  EcsCpuUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CanCreateEcsAlarms
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-ecs-cpu-alarm
+      AlarmDescription: !Sub "ECS CPU utilization exceeds ${EcsCpuThreshold}%"
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+        - Name: ServiceName
+          Value:
+            !If [
+              HasServiceName,
+              !Ref ServiceName,
+              !Sub "${ProjectName}-${Environment}-service",
+            ]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref EcsCpuThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref PipelineNotificationTopic]
+      OKActions: [!Ref PipelineNotificationTopic]
+
+  EcsMemoryUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CanCreateEcsAlarms
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-ecs-memory-alarm
+      AlarmDescription: !Sub "ECS memory utilization exceeds ${EcsMemoryThreshold}%"
+      Namespace: AWS/ECS
+      MetricName: MemoryUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+        - Name: ServiceName
+          Value:
+            !If [
+              HasServiceName,
+              !Ref ServiceName,
+              !Sub "${ProjectName}-${Environment}-service",
+            ]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref EcsMemoryThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref PipelineNotificationTopic]
+      OKActions: [!Ref PipelineNotificationTopic]
+
+  EcsRunningTaskCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CanCreateEcsAlarms
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-ecs-task-count-alarm
+      AlarmDescription: !Sub "ECS service has no running tasks"
+      Namespace: ECS/ContainerInsights
+      MetricName: RunningTaskCount
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+        - Name: ServiceName
+          Value:
+            !If [
+              HasServiceName,
+              !Ref ServiceName,
+              !Sub "${ProjectName}-${Environment}-service",
+            ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref PipelineNotificationTopic]
+      OKActions: [!Ref PipelineNotificationTopic]
+
+  AlbUnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CanCreateAlbAlarms
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-alb-unhealthy-hosts-alarm
+      AlarmDescription: !Sub "ALB target group has unhealthy hosts"
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref UnhealthyHostThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineNotificationTopic]
+      OKActions: [!Ref PipelineNotificationTopic]
+
+  AlbTargetResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CanCreateAlbAlarms
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-alb-response-time-alarm
+      AlarmDescription: !Sub "ALB response time exceeds ${ResponseTimeThreshold}s"
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref ResponseTimeThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineNotificationTopic]
+      OKActions: [!Ref PipelineNotificationTopic]
+
+  AlbHttp5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasLoadBalancerFullName
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-alb-5xx-error-alarm
+      AlarmDescription: !Sub "ALB returns 5xx errors"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineNotificationTopic]
+      OKActions: [!Ref PipelineNotificationTopic]
+
+Outputs:
+  NotificationTopicArn:
+    Description: SNS Topic ARN for pipeline notifications
+    Value: !Ref PipelineNotificationTopic
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-NotificationTopicArn
+
+  NotificationTopicName:
+    Description: SNS Topic Name
+    Value: !GetAtt PipelineNotificationTopic.TopicName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-NotificationTopicName
+
+  PipelineStateChangeRuleArn:
+    Description: CloudWatch Events Rule ARN for pipeline state changes
+    Condition: HasPipelineName
+    Value: !GetAtt PipelineStateChangeRule.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineStateChangeRuleArn
+
+  PipelineStageFailureRuleArn:
+    Description: CloudWatch Events Rule ARN for stage failures
+    Condition: HasPipelineName
+    Value: !GetAtt PipelineStageFailureRule.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineStageFailureRuleArn
+
+  PipelineActionFailureRuleArn:
+    Description: CloudWatch Events Rule ARN for action failures
+    Condition: HasPipelineName
+    Value: !GetAtt PipelineActionFailureRule.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineActionFailureRuleArn
+
+  DashboardName:
+    Description: CloudWatch Dashboard Name
+    Value: !Ref PipelineDashboard
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DashboardName
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${PipelineDashboard}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DashboardUrl
+
+  PipelineFailureAlarmArn:
+    Description: Pipeline Failure Alarm ARN
+    Condition: HasPipelineName
+    Value: !GetAtt PipelineFailureAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-PipelineFailureAlarmArn
+
+  EcsCpuUtilizationAlarmArn:
+    Description: ECS CPU Utilization Alarm ARN
+    Condition: CanCreateEcsAlarms
+    Value: !GetAtt EcsCpuUtilizationAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsCpuUtilizationAlarmArn
+
+  EcsMemoryUtilizationAlarmArn:
+    Description: ECS Memory Utilization Alarm ARN
+    Condition: CanCreateEcsAlarms
+    Value: !GetAtt EcsMemoryUtilizationAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsMemoryUtilizationAlarmArn
+
+  EcsRunningTaskCountAlarmArn:
+    Description: ECS Running Task Count Alarm ARN
+    Condition: CanCreateEcsAlarms
+    Value: !GetAtt EcsRunningTaskCountAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsRunningTaskCountAlarmArn
+
+  AlbUnhealthyHostAlarmArn:
+    Description: ALB Unhealthy Host Alarm ARN
+    Condition: CanCreateAlbAlarms
+    Value: !GetAtt AlbUnhealthyHostAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbUnhealthyHostAlarmArn
+
+  AlbTargetResponseTimeAlarmArn:
+    Description: ALB Target Response Time Alarm ARN
+    Condition: CanCreateAlbAlarms
+    Value: !GetAtt AlbTargetResponseTimeAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbTargetResponseTimeAlarmArn
+
+  AlbHttp5xxErrorAlarmArn:
+    Description: ALB HTTP 5xx Error Alarm ARN
+    Condition: HasLoadBalancerFullName
+    Value: !GetAtt AlbHttp5xxErrorAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbHttp5xxErrorAlarmArn
+
