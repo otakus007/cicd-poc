@@ -1,0 +1,548 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECS Service Stack for EC2 Launch Type.
+  Creates an ECS service using capacity provider strategy for EC2-backed deployment,
+  with rolling deployment, circuit breaker, ALB target group registration, and
+  auto-scaling configuration. This is an alternative to the Fargate service for
+  cost comparison purposes.
+  Requirements: 7.4 (ALB registration), 6.2 (rolling deployment), 6.3 (maintain healthy tasks),
+  6.4 (rollback on failure)
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - PrivateSubnet1Id
+          - PrivateSubnet2Id
+          - EcsSecurityGroupId
+      - Label:
+          default: "ECS Configuration"
+        Parameters:
+          - EcsClusterArn
+          - TaskDefinitionArn
+          - CapacityProviderName
+          - ContainerName
+          - ContainerPort
+      - Label:
+          default: "Load Balancer Configuration"
+        Parameters:
+          - TargetGroupArn
+      - Label:
+          default: "Service Configuration"
+        Parameters:
+          - DesiredCount
+          - MinimumHealthyPercent
+          - MaximumPercent
+          - HealthCheckGracePeriodSeconds
+      - Label:
+          default: "Auto Scaling Configuration"
+        Parameters:
+          - MinCapacity
+          - MaxCapacity
+          - CpuTargetValue
+          - MemoryTargetValue
+          - ScaleInCooldown
+          - ScaleOutCooldown
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      PrivateSubnet1Id:
+        default: "Private Subnet 1 ID"
+      PrivateSubnet2Id:
+        default: "Private Subnet 2 ID"
+      EcsSecurityGroupId:
+        default: "ECS Security Group ID"
+      EcsClusterArn:
+        default: "ECS Cluster ARN"
+      TaskDefinitionArn:
+        default: "Task Definition ARN"
+      CapacityProviderName:
+        default: "Capacity Provider Name"
+      ContainerName:
+        default: "Container Name"
+      ContainerPort:
+        default: "Container Port"
+      TargetGroupArn:
+        default: "ALB Target Group ARN"
+      DesiredCount:
+        default: "Desired Task Count"
+      MinimumHealthyPercent:
+        default: "Minimum Healthy Percent"
+      MaximumPercent:
+        default: "Maximum Percent"
+      HealthCheckGracePeriodSeconds:
+        default: "Health Check Grace Period (seconds)"
+      MinCapacity:
+        default: "Minimum Capacity"
+      MaxCapacity:
+        default: "Maximum Capacity"
+      CpuTargetValue:
+        default: "CPU Target Utilization (%)"
+      MemoryTargetValue:
+        default: "Memory Target Utilization (%)"
+      ScaleInCooldown:
+        default: "Scale In Cooldown (seconds)"
+      ScaleOutCooldown:
+        default: "Scale Out Cooldown (seconds)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  # Network Configuration
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet 1 ID for ECS tasks (AZ-a)
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet 2 ID for ECS tasks (AZ-b)
+
+  EcsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID for ECS tasks
+
+  # ECS Configuration
+  EcsClusterArn:
+    Type: String
+    Description: ARN of the ECS EC2 Cluster
+    AllowedPattern: ^arn:aws:ecs:[a-z0-9-]+:[0-9]+:cluster\/[a-zA-Z0-9_-]+$
+    ConstraintDescription: Must be a valid ECS Cluster ARN
+
+  TaskDefinitionArn:
+    Type: String
+    Description: ARN of the ECS Task Definition (EC2 compatible)
+    AllowedPattern: ^arn:aws:ecs:[a-z0-9-]+:[0-9]+:task-definition\/[a-zA-Z0-9_-]+:[0-9]+$
+    ConstraintDescription: Must be a valid ECS Task Definition ARN
+
+  CapacityProviderName:
+    Type: String
+    Description: Name of the ECS Capacity Provider for EC2 instances
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9_-]*$
+    MinLength: 1
+    MaxLength: 255
+    ConstraintDescription: Must be a valid capacity provider name
+
+  ContainerName:
+    Type: String
+    Description: Name of the container in the task definition
+    Default: japfa-api-dev
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 64
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens
+
+  ContainerPort:
+    Type: Number
+    Description: Port exposed by the container
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+    ConstraintDescription: Must be a valid port number (1-65535)
+
+  # Load Balancer Configuration
+  TargetGroupArn:
+    Type: String
+    Description: ARN of the ALB Target Group
+    AllowedPattern: ^arn:aws:elasticloadbalancing:[a-z0-9-]+:[0-9]+:targetgroup\/[a-zA-Z0-9-]+\/[a-z0-9]+$
+    ConstraintDescription: Must be a valid ALB Target Group ARN
+
+  # Service Configuration
+  DesiredCount:
+    Type: Number
+    Description: Desired number of tasks to run
+    Default: 2
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  MinimumHealthyPercent:
+    Type: Number
+    Description: >
+      Minimum healthy percent during deployment. Set to 50% to allow
+      zero-downtime deployments with at least one healthy task.
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  MaximumPercent:
+    Type: Number
+    Description: >
+      Maximum percent of tasks during deployment. Set to 200% to allow
+      double the desired count during rolling updates.
+    Default: 200
+    MinValue: 100
+    MaxValue: 400
+    ConstraintDescription: Must be between 100 and 400
+
+  HealthCheckGracePeriodSeconds:
+    Type: Number
+    Description: >
+      Seconds to wait before starting health checks on new tasks.
+      Allows time for container startup and initialization.
+    Default: 60
+    MinValue: 0
+    MaxValue: 2147483647
+    ConstraintDescription: Must be a non-negative integer
+
+  # Auto Scaling Configuration
+  MinCapacity:
+    Type: Number
+    Description: Minimum number of tasks for auto-scaling
+    Default: 2
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  MaxCapacity:
+    Type: Number
+    Description: Maximum number of tasks for auto-scaling
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  CpuTargetValue:
+    Type: Number
+    Description: Target CPU utilization percentage for auto-scaling
+    Default: 70
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  MemoryTargetValue:
+    Type: Number
+    Description: Target memory utilization percentage for auto-scaling
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  ScaleInCooldown:
+    Type: Number
+    Description: Cooldown period (seconds) after scale-in before another scale-in
+    Default: 300
+    MinValue: 0
+    MaxValue: 3600
+    ConstraintDescription: Must be between 0 and 3600 seconds
+
+  ScaleOutCooldown:
+    Type: Number
+    Description: Cooldown period (seconds) after scale-out before another scale-out
+    Default: 60
+    MinValue: 0
+    MaxValue: 3600
+    ConstraintDescription: Must be between 0 and 3600 seconds
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # ECS Service for EC2 Launch Type
+  # Purpose: Manages the deployment and scaling of ECS tasks on EC2 instances
+  # Requirement 7.4: THE EC2 service SHALL register with the same ALB target
+  #                  group as Fargate (or a parallel target group)
+  # Uses capacity provider strategy instead of launch type for EC2 deployment
+  # ---------------------------------------------------------------------------
+  EcsEc2Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-ec2-service
+      Cluster: !Ref EcsClusterArn
+      TaskDefinition: !Ref TaskDefinitionArn
+      DesiredCount: !Ref DesiredCount
+      # Use capacity provider strategy instead of LaunchType for EC2
+      # This enables managed scaling and termination protection
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProviderName
+          Weight: 1
+          Base: 1
+      # Network configuration for awsvpc network mode
+      # Tasks in private subnets use NAT Gateway for outbound
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # DISABLED: Tasks in private subnets use NAT Gateway for outbound
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1Id
+            - !Ref PrivateSubnet2Id
+          SecurityGroups:
+            - !Ref EcsSecurityGroupId
+      # Load balancer configuration
+      # Requirement 7.4: Register with ALB target group
+      LoadBalancers:
+        - ContainerName: !Ref ContainerName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroupArn
+      # Deployment configuration for rolling updates with circuit breaker
+      # MinimumHealthyPercent: 50% ensures at least one task remains healthy
+      # during deployment when DesiredCount is 2
+      DeploymentConfiguration:
+        MinimumHealthyPercent: !Ref MinimumHealthyPercent
+        MaximumPercent: !Ref MaximumPercent
+        # Deployment circuit breaker for automatic rollback
+        # Rolls back to previous task definition on health check failure
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Health check grace period allows time for container startup
+      # before ECS starts checking task health
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriodSeconds
+      # Enable ECS Exec for debugging and troubleshooting
+      # Allows running commands inside containers via AWS CLI
+      EnableExecuteCommand: true
+      # Enable ECS managed tags for cost allocation
+      EnableECSManagedTags: true
+      # Propagate tags from service to tasks
+      PropagateTags: SERVICE
+      # Scheduling strategy (REPLICA for standard deployment)
+      SchedulingStrategy: REPLICA
+      # Deployment controller type
+      DeploymentController:
+        Type: ECS
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-service
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS EC2 Service for API
+        - Key: ManagedBy
+          Value: CloudFormation
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: ec2
+
+  # ---------------------------------------------------------------------------
+  # Auto Scaling Target
+  # Purpose: Defines the scalable dimension for the ECS service
+  # Allows Application Auto Scaling to adjust the desired count
+  # ---------------------------------------------------------------------------
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: EcsEc2Service
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Sub
+        - service/${ClusterName}/${ServiceName}
+        - ClusterName: !Select [1, !Split ["/", !Ref EcsClusterArn]]
+          ServiceName: !GetAtt EcsEc2Service.Name
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  # ---------------------------------------------------------------------------
+  # CPU-Based Auto Scaling Policy
+  # Purpose: Scales the service based on average CPU utilization
+  # Target: 70% CPU utilization (configurable)
+  # ---------------------------------------------------------------------------
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-ec2-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref CpuTargetValue
+        # Cooldown periods prevent rapid scaling oscillations
+        ScaleInCooldown: !Ref ScaleInCooldown
+        ScaleOutCooldown: !Ref ScaleOutCooldown
+
+  # ---------------------------------------------------------------------------
+  # Memory-Based Auto Scaling Policy
+  # Purpose: Scales the service based on average memory utilization
+  # Target: 80% memory utilization (configurable)
+  # ---------------------------------------------------------------------------
+  MemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-ec2-memory-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: !Ref MemoryTargetValue
+        # Cooldown periods prevent rapid scaling oscillations
+        ScaleInCooldown: !Ref ScaleInCooldown
+        ScaleOutCooldown: !Ref ScaleOutCooldown
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Service Outputs
+  Ec2ServiceArn:
+    Description: ECS EC2 Service ARN
+    Value: !Ref EcsEc2Service
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ServiceArn
+
+  Ec2ServiceName:
+    Description: ECS EC2 Service Name
+    Value: !GetAtt EcsEc2Service.Name
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ServiceName
+
+  # Deployment Configuration Outputs
+  Ec2MinimumHealthyPercent:
+    Description: Minimum healthy percent during deployment
+    Value: !Ref MinimumHealthyPercent
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2MinimumHealthyPercent
+
+  Ec2MaximumPercent:
+    Description: Maximum percent during deployment
+    Value: !Ref MaximumPercent
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2MaximumPercent
+
+  Ec2DeploymentCircuitBreakerEnabled:
+    Description: Whether deployment circuit breaker is enabled
+    Value: "true"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2CircuitBreakerEnabled
+
+  Ec2DeploymentRollbackEnabled:
+    Description: Whether automatic rollback is enabled
+    Value: "true"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2RollbackEnabled
+
+  # Auto Scaling Outputs
+  Ec2AutoScalingTargetId:
+    Description: Auto Scaling Target ID
+    Value: !Ref AutoScalingTarget
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2AutoScalingTargetId
+
+  Ec2MinCapacity:
+    Description: Minimum capacity for auto-scaling
+    Value: !Ref MinCapacity
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2MinCapacity
+
+  Ec2MaxCapacity:
+    Description: Maximum capacity for auto-scaling
+    Value: !Ref MaxCapacity
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2MaxCapacity
+
+  Ec2CpuScalingPolicyArn:
+    Description: CPU-based scaling policy ARN
+    Value: !Ref CpuScalingPolicy
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2CpuScalingPolicyArn
+
+  Ec2MemoryScalingPolicyArn:
+    Description: Memory-based scaling policy ARN
+    Value: !Ref MemoryScalingPolicy
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2MemoryScalingPolicyArn
+
+  Ec2CpuTargetUtilization:
+    Description: Target CPU utilization for auto-scaling
+    Value: !Ref CpuTargetValue
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2CpuTargetUtilization
+
+  Ec2MemoryTargetUtilization:
+    Description: Target memory utilization for auto-scaling
+    Value: !Ref MemoryTargetValue
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2MemoryTargetUtilization
+
+  # Network Configuration Outputs
+  Ec2ServiceSubnets:
+    Description: Subnets where the service tasks are deployed
+    Value: !Sub "${PrivateSubnet1Id},${PrivateSubnet2Id}"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ServiceSubnets
+
+  Ec2ServiceSecurityGroup:
+    Description: Security group for the service tasks
+    Value: !Ref EcsSecurityGroupId
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ServiceSecurityGroup
+
+  # Health Check Configuration
+  Ec2HealthCheckGracePeriod:
+    Description: Health check grace period in seconds
+    Value: !Ref HealthCheckGracePeriodSeconds
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2HealthCheckGracePeriod
+
+  # Execute Command Status
+  Ec2ExecuteCommandEnabled:
+    Description: Whether ECS Exec is enabled for debugging
+    Value: "true"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ExecuteCommandEnabled
+
+  # Capacity Provider Configuration
+  Ec2CapacityProviderName:
+    Description: Capacity provider used by the service
+    Value: !Ref CapacityProviderName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ServiceCapacityProvider
+
+  # Compute Type Tag
+  ComputeType:
+    Description: Compute type for cost tracking
+    Value: ec2
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ServiceComputeType
+
+  # Service Configuration Summary
+  Ec2ServiceConfigurationSummary:
+    Description: Summary of EC2 service configuration
+    Value: !Sub |
+      Service: ${ProjectName}-${Environment}-ec2-service
+      Cluster: ${EcsClusterArn}
+      Capacity Provider: ${CapacityProviderName}
+      Desired Count: ${DesiredCount}
+      Min Healthy: ${MinimumHealthyPercent}%
+      Max Percent: ${MaximumPercent}%
+      Circuit Breaker: Enabled with Rollback
+      Auto Scaling: ${MinCapacity}-${MaxCapacity} tasks
+      CPU Target: ${CpuTargetValue}%
+      Memory Target: ${MemoryTargetValue}%
+      Compute Type: ec2
