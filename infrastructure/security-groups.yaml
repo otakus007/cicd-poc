@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Security Groups Stack for CI/CD Pipeline.
+  Creates security groups for VPC Link, ALB, ECS Tasks, and CodeBuild
+  following least-privilege principle.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - VpcCidr
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      VpcId:
+        default: "VPC ID"
+      VpcCidr:
+        default: "VPC CIDR Block"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where security groups will be created
+
+  VpcCidr:
+    Type: String
+    Description: VPC CIDR block for internal traffic rules
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.0.0/16)
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # VPC Link Security Group
+  # Purpose: Controls traffic from API Gateway VPC Link to internal ALB
+  # Ingress: HTTPS (443) from 0.0.0.0/0 for API Gateway
+  # ---------------------------------------------------------------------------
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-vpclink-sg
+      GroupDescription: Security group for API Gateway VPC Link - allows HTTPS from API Gateway
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from API Gateway
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpclink-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: API Gateway VPC Link
+
+  # ---------------------------------------------------------------------------
+  # ALB Security Group
+  # Purpose: Controls traffic to internal Application Load Balancer
+  # Ingress: HTTP (80) and HTTPS (443) from VPC Link SG only
+  # ---------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-alb-sg
+      GroupDescription: Security group for internal ALB - allows traffic from VPC Link only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+          Description: HTTP from VPC Link
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+          Description: HTTPS from VPC Link
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-alb-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Internal Application Load Balancer
+
+  # ---------------------------------------------------------------------------
+  # ECS Tasks Security Group
+  # Purpose: Controls traffic to/from ECS Fargate tasks
+  # Ingress: HTTP (80) from ALB SG only
+  # Egress: HTTPS (443) to 0.0.0.0/0 for AWS APIs, SQL Server (1433) to VPC CIDR
+  # ---------------------------------------------------------------------------
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-ecs-sg
+      GroupDescription: Security group for ECS Fargate tasks - allows traffic from ALB and outbound to AWS APIs and database
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS APIs and external services
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          CidrIp: !Ref VpcCidr
+          Description: SQL Server database access within VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS Fargate Tasks
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild Security Group
+  # Purpose: Controls outbound traffic from CodeBuild projects running in VPC
+  # Egress: HTTPS (443) and HTTP (80) to 0.0.0.0/0 for package downloads and AWS APIs
+  # ---------------------------------------------------------------------------
+  CodeBuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-codebuild-sg
+      GroupDescription: Security group for CodeBuild projects - allows outbound for package downloads and AWS APIs
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for package downloads and AWS APIs
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP outbound for package downloads
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-codebuild-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CodeBuild Projects
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # VPC Link Security Group Outputs
+  VpcLinkSecurityGroupId:
+    Description: VPC Link Security Group ID
+    Value: !Ref VpcLinkSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-VpcLinkSecurityGroupId
+
+  VpcLinkSecurityGroupName:
+    Description: VPC Link Security Group Name
+    Value: !Sub ${ProjectName}-${Environment}-vpclink-sg
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-VpcLinkSecurityGroupName
+
+  # ALB Security Group Outputs
+  AlbSecurityGroupId:
+    Description: ALB Security Group ID
+    Value: !Ref AlbSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbSecurityGroupId
+
+  AlbSecurityGroupName:
+    Description: ALB Security Group Name
+    Value: !Sub ${ProjectName}-${Environment}-alb-sg
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlbSecurityGroupName
+
+  # ECS Security Group Outputs
+  EcsSecurityGroupId:
+    Description: ECS Tasks Security Group ID
+    Value: !Ref EcsSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsSecurityGroupId
+
+  EcsSecurityGroupName:
+    Description: ECS Tasks Security Group Name
+    Value: !Sub ${ProjectName}-${Environment}-ecs-sg
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsSecurityGroupName
+
+  # CodeBuild Security Group Outputs
+  CodeBuildSecurityGroupId:
+    Description: CodeBuild Security Group ID
+    Value: !Ref CodeBuildSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CodeBuildSecurityGroupId
+
+  CodeBuildSecurityGroupName:
+    Description: CodeBuild Security Group Name
+    Value: !Sub ${ProjectName}-${Environment}-codebuild-sg
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CodeBuildSecurityGroupName
+
