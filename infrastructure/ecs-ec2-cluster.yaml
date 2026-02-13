@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECS EC2 Cluster Stack for CI/CD Pipeline.
+  Creates an ECS cluster with EC2 launch type, Auto Scaling Group, Capacity Provider,
+  and Container Insights enabled for monitoring. This is an alternative to the Fargate
+  deployment for cost comparison purposes.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Cluster Configuration"
+        Parameters:
+          - ContainerInsightsEnabled
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - PrivateSubnet1Id
+          - PrivateSubnet2Id
+          - EcsSecurityGroupId
+      - Label:
+          default: "EC2 Instance Configuration"
+        Parameters:
+          - InstanceType
+          - MinCapacity
+          - MaxCapacity
+          - DesiredCapacity
+          - RootVolumeSize
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      ContainerInsightsEnabled:
+        default: "Enable Container Insights"
+      PrivateSubnet1Id:
+        default: "Private Subnet 1 ID"
+      PrivateSubnet2Id:
+        default: "Private Subnet 2 ID"
+      EcsSecurityGroupId:
+        default: "ECS Security Group ID"
+      InstanceType:
+        default: "EC2 Instance Type"
+      MinCapacity:
+        default: "Minimum Capacity"
+      MaxCapacity:
+        default: "Maximum Capacity"
+      DesiredCapacity:
+        default: "Desired Capacity"
+      RootVolumeSize:
+        default: "Root Volume Size (GB)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  ContainerInsightsEnabled:
+    Type: String
+    Description: Enable Container Insights for monitoring (enabled/disabled)
+    Default: enabled
+    AllowedValues:
+      - enabled
+      - disabled
+    ConstraintDescription: Must be enabled or disabled
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 1 ID for EC2 instances (AZ-a)
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 2 ID for EC2 instances (AZ-b)
+
+  EcsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group ID for ECS EC2 instances
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for ECS container instances
+    Default: t3.medium
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  MinCapacity:
+    Type: Number
+    Description: Minimum number of EC2 instances in the Auto Scaling Group
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  MaxCapacity:
+    Type: Number
+    Description: Maximum number of EC2 instances in the Auto Scaling Group
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  DesiredCapacity:
+    Type: Number
+    Description: Desired number of EC2 instances in the Auto Scaling Group
+    Default: 2
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  RootVolumeSize:
+    Type: Number
+    Description: Size of the root EBS volume in GB
+    Default: 30
+    MinValue: 30
+    MaxValue: 500
+    ConstraintDescription: Must be between 30 and 500 GB
+
+  Ec2InstanceProfileArn:
+    Type: String
+    Description: ARN of the EC2 instance profile for ECS instances
+    Default: ""
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # ECS Cluster with EC2 Launch Type
+  # Requirement 1.1: THE ECS_EC2_Cluster SHALL be created with EC2 launch type
+  # Requirement 8.1: THE EC2 cluster SHALL have Container Insights enabled
+  # ---------------------------------------------------------------------------
+  EcsEc2Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-${Environment}-ec2-cluster
+      ClusterSettings:
+        # Enable Container Insights for monitoring
+        # Requirement 8.1: Container Insights enabled for monitoring
+        - Name: containerInsights
+          Value: !Ref ContainerInsightsEnabled
+      # Service Connect defaults for service mesh capabilities
+      ServiceConnectDefaults:
+        Namespace: !Sub ${ProjectName}-${Environment}-ec2
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-cluster
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS EC2 Cluster for API Services
+        - Key: ManagedBy
+          Value: CloudFormation
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: ec2
+
+  # ---------------------------------------------------------------------------
+  # ECS Capacity Provider
+  # Requirement 1.4: THE Capacity_Provider SHALL enable managed scaling with
+  #                  target capacity of 100%
+  # Requirement 4.1: THE Capacity_Provider SHALL enable managed termination
+  #                  protection for instances running tasks
+  # ---------------------------------------------------------------------------
+  EcsCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-cp
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroup
+        ManagedScaling:
+          # Enable managed scaling for automatic capacity adjustment
+          Status: ENABLED
+          # Requirement 1.4: Target capacity of 100%
+          TargetCapacity: 100
+          # Minimum scaling step size
+          MinimumScalingStepSize: 1
+          # Maximum scaling step size for faster scaling
+          MaximumScalingStepSize: 10
+          # Instance warmup period in seconds
+          InstanceWarmupPeriod: 300
+        # Requirement 4.1: Enable managed termination protection
+        # Prevents termination of instances running tasks
+        ManagedTerminationProtection: ENABLED
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-cp
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: ec2
+
+  # ---------------------------------------------------------------------------
+  # Cluster Capacity Provider Association
+  # Links the capacity provider to the ECS cluster with default strategy
+  # ---------------------------------------------------------------------------
+  ClusterCapacityProviderAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref EcsEc2Cluster
+      CapacityProviders:
+        - !Ref EcsCapacityProvider
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref EcsCapacityProvider
+          Weight: 1
+          Base: 1
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for ECS Container Logs
+  # Provides centralized logging for EC2-based ECS tasks
+  # ---------------------------------------------------------------------------
+  EcsEc2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}-ec2
+      RetentionInDays: !If
+        - IsProduction
+        - 90
+        - !If
+          - IsStaging
+          - 30
+          - 14
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-ecs-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS EC2 Container Logs
+        - Key: ManagedBy
+          Value: CloudFormation
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: ec2
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for Container Insights Performance Logs
+  # Provides detailed performance metrics when Container Insights is enabled
+  # ---------------------------------------------------------------------------
+  ContainerInsightsEc2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ecs/containerinsights/${ProjectName}-${Environment}-ec2-cluster/performance
+      RetentionInDays: !If
+        - IsProduction
+        - 90
+        - !If
+          - IsStaging
+          - 30
+          - 14
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-container-insights-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Container Insights Performance Logs for EC2 Cluster
+        - Key: ManagedBy
+          Value: CloudFormation
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: ec2
+
+  # ---------------------------------------------------------------------------
+  # Launch Template for EC2 Instances
+  # Will be added in Task 1.2
+  # ---------------------------------------------------------------------------
+  # Placeholder for Launch Template - to be implemented in Task 1.2
+
+  # ---------------------------------------------------------------------------
+  # Auto Scaling Group
+  # Will be completed in Task 1.3, but basic structure needed for Capacity Provider
+  # Requirement 1.6: Min capacity 1, max capacity 10 (configurable)
+  # Requirement 4.6: Distribute instances across multiple availability zones
+  # ---------------------------------------------------------------------------
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-${Environment}-ec2-asg
+      # Placeholder - LaunchTemplate will be added in Task 1.2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      # Requirement 4.6: Multi-AZ deployment
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      # Enable scale-in protection for instances managed by ECS
+      NewInstancesProtectedFromScaleIn: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-instance
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: true
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: ec2
+          PropagateAtLaunch: true
+        # Required tag for ECS managed scaling
+        - Key: AmazonECSManaged
+          Value: "true"
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+
+  # ---------------------------------------------------------------------------
+  # Launch Template (Basic structure for Task 1.1, will be enhanced in Task 1.2)
+  # Requirement 1.2: Use latest ECS-optimized Amazon Linux 2023 AMI
+  # Requirement 5.1: Configure ECS agent with cluster name via user data
+  # ---------------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectName}-${Environment}-ec2-lt
+      LaunchTemplateData:
+        # Use SSM parameter to get latest ECS-optimized AMI
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id}}"
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !Ref Ec2InstanceProfileArn
+        SecurityGroupIds:
+          - !Ref EcsSecurityGroupId
+        # Requirement 5.3: Enable detailed CloudWatch monitoring
+        Monitoring:
+          Enabled: true
+        # Requirement 5.4: EBS-optimized storage enabled
+        EbsOptimized: true
+        # Requirement 5.5: Configure appropriate root volume size (30GB minimum)
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        # Requirement 5.1: Configure ECS agent with cluster name via user data
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Configure ECS agent to register with the correct cluster
+            echo "ECS_CLUSTER=${EcsEc2Cluster}" >> /etc/ecs/ecs.config
+            # Enable container metadata for enhanced monitoring
+            echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
+            # Enable spot instance draining for graceful shutdown
+            echo "ECS_ENABLE_SPOT_INSTANCE_DRAINING=true" >> /etc/ecs/ecs.config
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-${Environment}-ecs-instance
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: ManagedBy
+                Value: CloudFormation
+              # Requirement 3.1: ComputeType tag for cost tracking
+              - Key: ComputeType
+                Value: ec2
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-${Environment}-ecs-volume
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: ManagedBy
+                Value: CloudFormation
+              # Requirement 3.1: ComputeType tag for cost tracking
+              - Key: ComputeType
+                Value: ec2
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Cluster Outputs
+  Ec2ClusterArn:
+    Description: ECS EC2 Cluster ARN
+    Value: !GetAtt EcsEc2Cluster.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2ClusterArn
+
+  Ec2ClusterName:
+    Description: ECS EC2 Cluster Name
+    Value: !Ref EcsEc2Cluster
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2ClusterName
+
+  Ec2ClusterId:
+    Description: ECS EC2 Cluster ID
+    Value: !Ref EcsEc2Cluster
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2ClusterId
+
+  # Capacity Provider Outputs
+  CapacityProviderName:
+    Description: ECS Capacity Provider Name
+    Value: !Ref EcsCapacityProvider
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2CapacityProviderName
+
+  # Auto Scaling Group Outputs
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2AsgName
+
+  AutoScalingGroupArn:
+    Description: Auto Scaling Group ARN (constructed from name)
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2AsgArn
+
+  # Launch Template Outputs
+  LaunchTemplateId:
+    Description: Launch Template ID
+    Value: !Ref LaunchTemplate
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2LaunchTemplateId
+
+  LaunchTemplateLatestVersion:
+    Description: Launch Template Latest Version Number
+    Value: !GetAtt LaunchTemplate.LatestVersionNumber
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2LaunchTemplateVersion
+
+  # Container Insights Status
+  ContainerInsightsStatus:
+    Description: Container Insights enabled status
+    Value: !Ref ContainerInsightsEnabled
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ContainerInsightsStatus
+
+  # Log Group Outputs
+  EcsEc2LogGroupArn:
+    Description: CloudWatch Log Group ARN for ECS EC2 container logs
+    Value: !GetAtt EcsEc2LogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2LogGroupArn
+
+  EcsEc2LogGroupName:
+    Description: CloudWatch Log Group Name for ECS EC2 container logs
+    Value: !Ref EcsEc2LogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsEc2LogGroupName
+
+  ContainerInsightsEc2LogGroupArn:
+    Description: CloudWatch Log Group ARN for Container Insights performance logs
+    Value: !GetAtt ContainerInsightsEc2LogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContainerInsightsEc2LogGroupArn
+
+  ContainerInsightsEc2LogGroupName:
+    Description: CloudWatch Log Group Name for Container Insights performance logs
+    Value: !Ref ContainerInsightsEc2LogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ContainerInsightsEc2LogGroupName
+
+  # Service Connect Namespace
+  ServiceConnectNamespace:
+    Description: Service Connect default namespace for EC2 cluster
+    Value: !Sub ${ProjectName}-${Environment}-ec2
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ServiceConnectNamespace
+
+  # Compute Type Tag
+  ComputeType:
+    Description: Compute type for cost tracking
+    Value: ec2
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ComputeType
