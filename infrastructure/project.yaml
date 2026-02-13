@@ -1,0 +1,776 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Per-Project Stack for Multi-Service Platform.
+  Deploys a new project (pipeline + service) on top of shared infrastructure.
+  Creates: ECR, Secrets, CodeBuild projects, CodePipeline, Task Definition,
+  ECS Service, ALB Target Group + Listener Rule.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # --- Shared Infra Reference ---
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  InfraProjectName:
+    Type: String
+    Description: Project name of the shared infrastructure stack (e.g. japfa-api)
+    Default: japfa-api
+
+  # --- This Project ---
+  ServiceName:
+    Type: String
+    Description: Short name for this project/service (e.g. cash-collection, poultry-sale)
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+
+  # --- Azure DevOps ---
+  AzureDevOpsOrganization:
+    Type: String
+    MinLength: 1
+  AzureDevOpsProject:
+    Type: String
+    MinLength: 1
+  AzureDevOpsRepository:
+    Type: String
+    MinLength: 1
+  BranchName:
+    Type: String
+    Default: main
+
+  # --- ALB Routing ---
+  PathPattern:
+    Type: String
+    Description: ALB path pattern for this service (e.g. /api/cash-collection/*)
+    Default: /api/*
+
+  ListenerRulePriority:
+    Type: Number
+    Description: ALB listener rule priority (must be unique per project, 1-50000)
+    Default: 100
+    MinValue: 1
+    MaxValue: 50000
+
+  # --- Container ---
+  ContainerCpu:
+    Type: String
+    Default: "512"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+  ContainerMemory:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "3072", "4096"]
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+  ContainerPort:
+    Type: Number
+    Description: Port the container listens on
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+  HealthCheckGracePeriod:
+    Type: Number
+    Description: Seconds to wait before starting health checks on new tasks
+    Default: 120
+    MinValue: 0
+    MaxValue: 1800
+
+  # --- Templates Bucket ---
+  TemplatesBucketName:
+    Type: String
+    Description: S3 bucket containing buildspec templates
+  TemplatesBucketPrefix:
+    Type: String
+    Default: infrastructure
+
+  # --- Health Check ---
+  HealthCheckPath:
+    Type: String
+    Default: /health
+
+  PathBase:
+    Type: String
+    Description: URL path prefix for the service (e.g. /collection/api/v2.1). Stripped by ASP.NET UsePathBase.
+    Default: ""
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # ECR Repository
+  # ---------------------------------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${InfraProjectName}-${Environment}-${ServiceName}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep last 10 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  # ---------------------------------------------------------------------------
+  # Secrets
+  # ---------------------------------------------------------------------------
+  PatSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${InfraProjectName}/${Environment}/${ServiceName}/azure-devops-pat
+      Description: !Sub "Azure DevOps PAT for ${ServiceName}"
+      SecretString: '{"pat":"PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT"}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${InfraProjectName}/${Environment}/${ServiceName}/db/connection-strings
+      Description: !Sub "Database connection strings for ${ServiceName}"
+      SecretString: '{"ConnectionStrings__Default":"PLACEHOLDER"}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  # ---------------------------------------------------------------------------
+  # ALB Target Group for this service
+  # ---------------------------------------------------------------------------
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-tg
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      VpcId:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-VpcId
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckTimeoutSeconds: 5
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  # ---------------------------------------------------------------------------
+  # ALB Listener Rule — path-based routing to this service
+  # ---------------------------------------------------------------------------
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-HttpListenerArn
+      Priority: !Ref ListenerRulePriority
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - !Ref PathPattern
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------------
+  # ECS Task Definition
+  # ---------------------------------------------------------------------------
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${InfraProjectName}-${Environment}-${ServiceName}
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-EcsExecutionRoleArn
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-EcsTaskRoleArn
+      ContainerDefinitions:
+        - Name: !Sub ${ServiceName}-container
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${InfraProjectName}-${Environment}-${ServiceName}:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: ASPNETCORE_ENVIRONMENT
+              Value: !Ref Environment
+            - Name: SERVICE_NAME
+              Value: !Ref ServiceName
+            - Name: PATH_BASE
+              Value: !Ref PathBase
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  ServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${InfraProjectName}-${Environment}-${ServiceName}
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # ECS Service
+  # ---------------------------------------------------------------------------
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerRule
+    Properties:
+      ServiceName: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-svc
+      Cluster:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-EcsClusterArn
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriod
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-PrivateSubnet1Id
+            - Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-PrivateSubnet2Id
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-EcsSecurityGroupId
+      LoadBalancers:
+        - ContainerName: !Sub ${ServiceName}-container
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild — Source (clone from Azure DevOps)
+  # ---------------------------------------------------------------------------
+  SourceBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${InfraProjectName}-${Environment}-${ServiceName}-source
+      RetentionInDays: 30
+
+  SourceProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-source
+      ServiceRole:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: AZURE_DEVOPS_ORGANIZATION
+            Value: !Ref AzureDevOpsOrganization
+          - Name: AZURE_DEVOPS_PROJECT
+            Value: !Ref AzureDevOpsProject
+          - Name: AZURE_DEVOPS_REPOSITORY
+            Value: !Ref AzureDevOpsRepository
+          - Name: BRANCH_NAME
+            Value: !Ref BranchName
+          - Name: PROJECT_NAME
+            Value: !Ref InfraProjectName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-source.yml
+      VpcConfig:
+        VpcId:
+          Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-VpcId
+        Subnets:
+          - Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-PrivateSubnet1Id
+          - Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-PrivateSubnet2Id
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodeBuildSecurityGroupId
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref SourceBuildLogGroup
+      TimeoutInMinutes: 15
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild — Swagger Generation (extract OpenAPI spec from ASP.NET build)
+  # ---------------------------------------------------------------------------
+  SwaggerGenLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${InfraProjectName}-${Environment}-${ServiceName}-swagger-gen
+      RetentionInDays: 30
+
+  SwaggerGenProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-swagger-gen
+      ServiceRole:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref InfraProjectName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+          - Name: OPENAPI_SPEC_PATH
+            Value: ""
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-swagger-gen.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref SwaggerGenLogGroup
+      TimeoutInMinutes: 15
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild — Lint (API Governance with Spectral)
+  # ---------------------------------------------------------------------------
+  LintLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${InfraProjectName}-${Environment}-${ServiceName}-lint
+      RetentionInDays: 30
+
+  LintProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-lint
+      ServiceRole:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref InfraProjectName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+          - Name: OPENAPI_SPEC_PATH
+            Value: ""
+          - Name: SNS_TOPIC_ARN
+            Value:
+              Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-NotificationTopicArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-lint.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LintLogGroup
+      TimeoutInMinutes: 10
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild — Build
+  # ---------------------------------------------------------------------------
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${InfraProjectName}-${Environment}-${ServiceName}-build
+      RetentionInDays: 30
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-build
+      ServiceRole:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref InfraProjectName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-build.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      TimeoutInMinutes: 30
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild — Push to ECR
+  # ---------------------------------------------------------------------------
+  PushLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${InfraProjectName}-${Environment}-${ServiceName}-push
+      RetentionInDays: 30
+
+  PushProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-push
+      ServiceRole:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REPO
+            Value: !Sub ${InfraProjectName}-${Environment}-${ServiceName}
+          - Name: PROJECT_NAME
+            Value: !Ref InfraProjectName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-push.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref PushLogGroup
+      TimeoutInMinutes: 15
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild — Contract Test (Dredd)
+  # ---------------------------------------------------------------------------
+  ContractTestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${InfraProjectName}-${Environment}-${ServiceName}-contract-test
+      RetentionInDays: 30
+
+  ContractTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-contract-test
+      ServiceRole:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref InfraProjectName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+          - Name: API_GATEWAY_ENDPOINT
+            Value:
+              Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-ApiGatewayEndpoint
+          - Name: OPENAPI_SPEC_PATH
+            Value: ""
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-contract-test.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref ContractTestLogGroup
+      TimeoutInMinutes: 15
+
+  # ---------------------------------------------------------------------------
+  # Pipeline Artifact Bucket
+  # ---------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-artifacts-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  # ---------------------------------------------------------------------------
+  # CodePipeline
+  # ---------------------------------------------------------------------------
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-pipeline
+      RoleArn:
+        Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-CodePipelineRoleArn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      RestartExecutionOnUpdate: false
+      Stages:
+        # Stage 1: S3 Source trigger
+        - Name: Source
+          Actions:
+            - Name: S3Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: trigger/trigger.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: TriggerOutput
+              RunOrder: 1
+
+        # Stage 2: Clone from Azure DevOps
+        - Name: CloneSource
+          Actions:
+            - Name: CloneRepository
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SourceProject
+              InputArtifacts:
+                - Name: TriggerOutput
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        # Stage 3: Generate OpenAPI spec (if not already in source)
+        - Name: SwaggerGen
+          Actions:
+            - Name: GenerateSpec
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SwaggerGenProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: SwaggerGenOutput
+              RunOrder: 1
+
+        # Stage 4: Lint (API Governance with Spectral)
+        - Name: Lint
+          Actions:
+            - Name: APIGovernance
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref LintProject
+              InputArtifacts:
+                - Name: SwaggerGenOutput
+              OutputArtifacts:
+                - Name: LintOutput
+              RunOrder: 1
+
+        # Stage 5: Build + Docker image
+        - Name: Build
+          Actions:
+            - Name: BuildAndTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SwaggerGenOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+        # Stage 6: Push to ECR
+        - Name: Push
+          Actions:
+            - Name: PushToECR
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref PushProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: PushOutput
+              RunOrder: 1
+
+        # Stage 7: Deploy to ECS
+        - Name: Deploy
+          Actions:
+            - Name: DeployToECS
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: "1"
+              Configuration:
+                ClusterName:
+                  Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-EcsClusterName
+                ServiceName: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-svc
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: PushOutput
+              RunOrder: 1
+
+        # Stage 8: Contract Test (Dredd)
+        - Name: ContractTest
+          Actions:
+            - Name: DreddContractTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref ContractTestProject
+              InputArtifacts:
+                - Name: SwaggerGenOutput
+              OutputArtifacts:
+                - Name: ContractTestOutput
+              RunOrder: 1
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  ServiceName:
+    Description: Service name
+    Value: !Ref ServiceName
+
+  EcrRepositoryUri:
+    Description: ECR Repository URI
+    Value: !GetAtt EcrRepository.RepositoryUri
+
+  PipelineName:
+    Description: CodePipeline name
+    Value: !Ref Pipeline
+
+  PipelineArn:
+    Description: CodePipeline ARN
+    Value: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${InfraProjectName}-${Environment}-${ServiceName}-pipeline
+
+  EcsServiceName:
+    Description: ECS Service name
+    Value: !Sub ${InfraProjectName}-${Environment}-${ServiceName}-svc
+
+  TargetGroupArn:
+    Description: ALB Target Group ARN
+    Value: !Ref TargetGroup
+
+  ArtifactBucketName:
+    Description: Pipeline artifact bucket
+    Value: !Ref ArtifactBucket
+
+  PatSecretArn:
+    Description: PAT secret ARN — update after deployment
+    Value: !Ref PatSecret
+
+  DbSecretArn:
+    Description: DB connection strings secret ARN — update after deployment
+    Value: !Ref DbSecret
+
+  PostDeployInstructions:
+    Description: Next steps after deployment
+    Value: !Sub |
+      1. Update PAT: ./scripts/setup-pat.sh -e ${Environment} -s ${ServiceName}
+      2. Update DB: aws secretsmanager put-secret-value --secret-id ${InfraProjectName}/${Environment}/${ServiceName}/db/connection-strings --secret-string '{"ConnectionStrings__Default":"Server=..."}'
+      3. Trigger pipeline: aws codepipeline start-pipeline-execution --name ${InfraProjectName}-${Environment}-${ServiceName}-pipeline
+
