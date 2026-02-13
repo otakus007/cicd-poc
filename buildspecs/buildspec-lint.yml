@@ -1,0 +1,216 @@
+# BuildSpec for API Governance Linting Stage
+# Validates OpenAPI specifications against organizational standards using Spectral
+#
+# Severity behavior:
+#   error (severity 0) — BLOCKS the build and sends SNS notification
+#   warn  (severity 1) — Reported but does NOT block the build
+#   info  (severity 2) — Reported but does NOT block the build
+#
+# Validates: Requirements 3.1, 3.2, 3.5
+# - 3.1: Validate OpenAPI specifications against the configured ruleset
+# - 3.2: Report violations as warnings without failing the build
+# - 3.5: Generate governance report; block only on error-severity rules
+
+version: 0.2
+
+env:
+  variables:
+    SPECTRAL_TELEMETRY: "off"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - echo "Installing Spectral CLI for API governance linting..."
+      - npm install -g @stoplight/spectral-cli
+      - spectral --version
+
+  pre_build:
+    commands:
+      - echo "============================================"
+      - echo "API Governance Linting Stage"
+      - echo "============================================"
+      - 'echo "Build ID: ${CODEBUILD_BUILD_ID}"'
+      - 'echo "Source Version: ${CODEBUILD_RESOLVED_SOURCE_VERSION}"'
+      - echo "============================================"
+      - |
+        SPEC_FILE=""
+        if [ -n "${OPENAPI_SPEC_PATH:-}" ] && [ -f "${OPENAPI_SPEC_PATH}" ]; then
+          SPEC_FILE="${OPENAPI_SPEC_PATH}"
+        else
+          for candidate in \
+            "./swagger.json" \
+            "./openapi.json" \
+            "./openapi.yaml" \
+            "./openapi.yml" \
+            "./docs/swagger.json" \
+            "./docs/openapi.json" \
+            "./docs/openapi.yaml" \
+            ; do
+            if [ -f "$candidate" ]; then
+              SPEC_FILE="$candidate"
+              break
+            fi
+          done
+          if [ -z "$SPEC_FILE" ]; then
+            SPEC_FILE=$(find . -maxdepth 3 -name "swagger.json" -o -name "openapi.json" -o -name "openapi.yaml" | head -1)
+          fi
+        fi
+        export SPEC_FILE
+      - |
+        if [ -n "$SPEC_FILE" ]; then
+          echo "Found OpenAPI specification: $SPEC_FILE"
+        else
+          echo "No OpenAPI specification found in project"
+          echo "Set OPENAPI_SPEC_PATH env var in CodeBuild project to specify a custom location"
+          echo "[]" > spectral-report.json
+        fi
+
+  build:
+    commands:
+      - echo "Running Spectral API governance linting..."
+      - |
+        if [ -n "$SPEC_FILE" ]; then
+          RULESET_ARG=""
+          if [ -f ".spectral.yml" ]; then
+            RULESET_ARG="--ruleset .spectral.yml"
+            echo "Using shared ruleset: .spectral.yml"
+          elif [ -f ".spectral.yaml" ]; then
+            RULESET_ARG="--ruleset .spectral.yaml"
+            echo "Using shared ruleset: .spectral.yaml"
+          else
+            echo "No shared .spectral.yml ruleset found — using Spectral defaults"
+          fi
+          spectral lint "$SPEC_FILE" \
+            $RULESET_ARG \
+            --format stylish \
+            --format json \
+            --output.json spectral-report.json || true
+        fi
+
+      # Parse report and determine pass/fail
+      - |
+        echo ""
+        echo "============================================"
+        echo "API Governance Report"
+        echo "============================================"
+        HAS_ERRORS=0
+
+        if [ -f "spectral-report.json" ]; then
+          TOTAL=$(jq 'length' spectral-report.json)
+          ERRORS=$(jq '[.[] | select(.severity == 0)] | length' spectral-report.json)
+          WARNINGS=$(jq '[.[] | select(.severity == 1)] | length' spectral-report.json)
+          INFOS=$(jq '[.[] | select(.severity == 2)] | length' spectral-report.json)
+          HINTS=$(jq '[.[] | select(.severity == 3)] | length' spectral-report.json)
+
+          echo "Total issues: $TOTAL"
+          echo "--------------------------------------------"
+          echo "  Errors (build-blocking): $ERRORS"
+          echo "  Warnings:               $WARNINGS"
+          echo "  Info:                    $INFOS"
+          echo "  Hints:                   $HINTS"
+          echo "--------------------------------------------"
+
+          if [ "$TOTAL" -gt 0 ]; then
+            echo ""
+            echo "Issues by Rule:"
+            echo "--------------------------------------------"
+            jq -r 'group_by(.code) | .[] | "\(.[0].code): \(length) occurrence(s)"' spectral-report.json | sort -t: -k2 -rn | head -15
+            echo "--------------------------------------------"
+          fi
+
+          if [ "$ERRORS" -gt 0 ]; then
+            HAS_ERRORS=1
+            echo ""
+            echo "============================================"
+            echo "BLOCKING ERRORS FOUND ($ERRORS)"
+            echo "============================================"
+            jq -r '.[] | select(.severity == 0) | "  \u274c [\(.code)] \(.message) at \(.path | join("."))"' spectral-report.json
+            echo "============================================"
+          fi
+        else
+          TOTAL=0; ERRORS=0; WARNINGS=0; INFOS=0
+        fi
+        export HAS_ERRORS ERRORS WARNINGS INFOS TOTAL
+
+      # Send SNS notification if errors found
+      - |
+        if [ "$HAS_ERRORS" -eq 1 ] && [ -n "${SNS_TOPIC_ARN:-}" ]; then
+          echo "Sending SNS notification for governance errors..."
+          ERROR_DETAILS=$(jq -r '.[] | select(.severity == 0) | "- [\(.code)] \(.message) at \(.path | join("."))"' spectral-report.json | head -20)
+          SNS_MESSAGE=$(cat <<SNSMSG
+        API Governance FAILED for ${SERVICE_NAME:-unknown} (${ENVIRONMENT:-unknown})
+
+        Build: ${CODEBUILD_BUILD_ID}
+        Spec:  ${SPEC_FILE:-none}
+
+        ${ERRORS} blocking error(s) found:
+        ${ERROR_DETAILS}
+
+        Warnings: ${WARNINGS} | Info: ${INFOS}
+
+        View full report in CodeBuild logs.
+        SNSMSG
+          )
+          aws sns publish \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "API Governance FAILED: ${SERVICE_NAME:-unknown} [${ENVIRONMENT:-unknown}]" \
+            --message "$SNS_MESSAGE" \
+            --region "${AWS_REGION:-us-east-1}" || echo "Failed to send SNS notification"
+        fi
+
+      # Generate summary JSON
+      - |
+        if [ -f "spectral-report.json" ]; then
+          if [ "$HAS_ERRORS" -eq 1 ]; then
+            STATUS="FAILED"
+            PROCEED="false"
+          else
+            STATUS="COMPLETED_WITH_WARNINGS"
+            PROCEED="true"
+          fi
+          cat > lint-summary.json << EOF
+        {
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "buildId": "${CODEBUILD_BUILD_ID}",
+          "sourceVersion": "${CODEBUILD_RESOLVED_SOURCE_VERSION}",
+          "specificationFile": "${SPEC_FILE:-none}",
+          "rulesetFile": ".spectral.yml",
+          "results": {
+            "totalIssues": $TOTAL,
+            "errors": $ERRORS,
+            "warnings": $WARNINGS,
+            "infos": $INFOS
+          },
+          "status": "$STATUS",
+          "buildProceed": $PROCEED
+        }
+        EOF
+        fi
+
+  post_build:
+    commands:
+      - echo "============================================"
+      - echo "Lint Stage Complete"
+      - echo "============================================"
+      - |
+        if [ "$HAS_ERRORS" -eq 1 ]; then
+          echo "BUILD BLOCKED: $ERRORS error-severity governance violation(s)"
+          echo "Fix the errors above and re-run the pipeline."
+          exit 1
+        else
+          echo "Build proceeds — $WARNINGS warning(s), $INFOS info(s)"
+          exit 0
+        fi
+
+artifacts:
+  files:
+    - spectral-report.json
+    - lint-summary.json
+  name: lint-reports
+  discard-paths: yes
+
+cache:
+  paths:
+    - "/root/.npm/**/*"
