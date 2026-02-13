@@ -1,0 +1,485 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECS Task Definition Stack for EC2 Launch Type.
+  Creates an EC2-compatible task definition with awsvpc network mode for ALB integration,
+  container configuration, health checks, CloudWatch Logs, and Secrets Manager integration.
+  Requirements: 7.1 (same container image), 7.2 (awsvpc network mode), 7.3 (CPU/memory), 7.5 (health check)
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Container Configuration"
+        Parameters:
+          - ContainerImage
+          - ContainerPort
+          - TaskCpu
+          - TaskMemory
+      - Label:
+          default: "Health Check Configuration"
+        Parameters:
+          - HealthCheckPath
+          - HealthCheckInterval
+          - HealthCheckTimeout
+          - HealthCheckRetries
+          - HealthCheckStartPeriod
+      - Label:
+          default: "Logging Configuration"
+        Parameters:
+          - LogRetentionDays
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      ContainerImage:
+        default: "Container Image URI"
+      ContainerPort:
+        default: "Container Port"
+      TaskCpu:
+        default: "Task CPU Units"
+      TaskMemory:
+        default: "Task Memory (MB)"
+      HealthCheckPath:
+        default: "Health Check Path"
+      HealthCheckInterval:
+        default: "Health Check Interval (seconds)"
+      HealthCheckTimeout:
+        default: "Health Check Timeout (seconds)"
+      HealthCheckRetries:
+        default: "Health Check Retries"
+      HealthCheckStartPeriod:
+        default: "Health Check Start Period (seconds)"
+      LogRetentionDays:
+        default: "Log Retention (days)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  ContainerImage:
+    Type: String
+    Description: >
+      ECR image URI for the container. Use placeholder for initial deployment,
+      then update via CI/CD pipeline. Format: {account}.dkr.ecr.{region}.amazonaws.com/{repo}:{tag}
+    Default: "PLACEHOLDER_IMAGE_URI"
+
+  ContainerPort:
+    Type: Number
+    Description: Port exposed by the container for the .NET application
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+    ConstraintDescription: Must be a valid port number (1-65535)
+
+  TaskCpu:
+    Type: String
+    Description: >
+      CPU units for the EC2 task (required for awsvpc network mode).
+      512 CPU units = 0.5 vCPU, suitable for .NET 6 Web API.
+    Default: "512"
+    AllowedValues:
+      - "256"
+      - "512"
+      - "1024"
+      - "2048"
+      - "4096"
+    ConstraintDescription: Must be a valid CPU configuration
+
+  TaskMemory:
+    Type: String
+    Description: >
+      Memory (MB) for the EC2 task (required for awsvpc network mode).
+      1024 MB = 1 GB, suitable for .NET 6 Web API with 512 CPU units.
+    Default: "1024"
+    AllowedValues:
+      # 256 CPU: 512, 1024, 2048
+      - "512"
+      - "1024"
+      - "2048"
+      # 512 CPU: 1024, 2048, 3072, 4096
+      - "3072"
+      - "4096"
+      # 1024 CPU: 2048, 3072, 4096, 5120, 6144, 7168, 8192
+      - "5120"
+      - "6144"
+      - "7168"
+      - "8192"
+    ConstraintDescription: Must be a valid memory configuration compatible with CPU
+
+  HealthCheckPath:
+    Type: String
+    Description: HTTP path for container health check endpoint
+    Default: /health
+    AllowedPattern: ^/.*$
+    ConstraintDescription: Must start with forward slash
+
+  HealthCheckInterval:
+    Type: Number
+    Description: Seconds between health checks
+    Default: 30
+    MinValue: 5
+    MaxValue: 300
+    ConstraintDescription: Must be between 5 and 300 seconds
+
+  HealthCheckTimeout:
+    Type: Number
+    Description: Seconds to wait for health check response
+    Default: 5
+    MinValue: 2
+    MaxValue: 60
+    ConstraintDescription: Must be between 2 and 60 seconds
+
+  HealthCheckRetries:
+    Type: Number
+    Description: Number of consecutive health check failures before marking unhealthy
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: Must be between 1 and 10 retries
+
+  HealthCheckStartPeriod:
+    Type: Number
+    Description: Seconds to wait before starting health checks (container startup grace period)
+    Default: 60
+    MinValue: 0
+    MaxValue: 300
+    ConstraintDescription: Must be between 0 and 300 seconds
+
+  LogRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudWatch Logs
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+    ConstraintDescription: Must be a valid CloudWatch Logs retention period
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for Container Logs
+  # Purpose: Centralized logging for ECS container output
+  # Requirement 7.1: Same logging configuration as Fargate task definition
+  # ---------------------------------------------------------------------------
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}-ec2-task
+      RetentionInDays: !If
+        - IsProduction
+        - 90
+        - !If
+          - IsStaging
+          - 60
+          - !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-task-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS EC2 Task Container Logs
+        - Key: ComputeType
+          Value: ec2
+
+  # ---------------------------------------------------------------------------
+  # ECS Task Definition for EC2 Launch Type
+  # Purpose: Defines the container configuration for EC2 deployment
+  # Requirement 7.1: Same container image as Fargate task definition
+  # Requirement 7.2: awsvpc network mode for ALB integration
+  # Requirement 7.3: Compatible CPU and memory configurations
+  # Requirement 7.5: Identical health check configuration to Fargate
+  # ---------------------------------------------------------------------------
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: TaskLogGroup
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-ec2-task
+      # EC2 launch type with awsvpc network mode for ALB integration
+      # Requirement 7.2: Configure network mode as "awsvpc" for ALB integration
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - EC2
+      # CPU and Memory at task level (required for awsvpc network mode)
+      # Requirement 7.3: Compatible CPU and memory configurations
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      # IAM Roles (same as Fargate task definition)
+      # ExecutionRoleArn: Used by ECS agent to pull images and retrieve secrets
+      # TaskRoleArn: Used by the application at runtime for AWS API calls
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-execution-role
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-task-role
+      # Container definitions (same as Fargate task definition)
+      ContainerDefinitions:
+        - Name: !Sub ${ProjectName}-${Environment}
+          # Requirement 7.1: Same container image as Fargate task definition
+          Image: !Ref ContainerImage
+          Essential: true
+          # Port mappings for the .NET application
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+              # AppProtocol for Service Connect (optional)
+              AppProtocol: http
+          # Health check configuration
+          # Requirement 7.5: Identical health check configuration to Fargate
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub curl -f http://localhost:${ContainerPort}${HealthCheckPath} || exit 1
+            Interval: !Ref HealthCheckInterval
+            Timeout: !Ref HealthCheckTimeout
+            Retries: !Ref HealthCheckRetries
+            StartPeriod: !Ref HealthCheckStartPeriod
+          # CloudWatch Logs configuration (same as Fargate)
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              # Enable multiline log handling for .NET stack traces
+              awslogs-datetime-format: "%Y-%m-%d %H:%M:%S"
+          # Secrets injection from Secrets Manager (same as Fargate)
+          Secrets:
+            # Database connection string for PoultrySale database
+            - Name: ConnectionStrings__PoultrySale
+              ValueFrom: !Sub
+                - "arn:aws:secretsmanager:${Region}:${Account}:secret:${Project}/${Env}/db/connection-strings:ConnectionStrings__PoultrySale::"
+                - Region: !Ref AWS::Region
+                  Account: !Ref AWS::AccountId
+                  Project: !Ref ProjectName
+                  Env: !Ref Environment
+            # Database connection string for MasterDb database
+            - Name: ConnectionStrings__MasterDb
+              ValueFrom: !Sub
+                - "arn:aws:secretsmanager:${Region}:${Account}:secret:${Project}/${Env}/db/connection-strings:ConnectionStrings__MasterDb::"
+                - Region: !Ref AWS::Region
+                  Account: !Ref AWS::AccountId
+                  Project: !Ref ProjectName
+                  Env: !Ref Environment
+          # Environment variables (non-sensitive configuration, same as Fargate)
+          Environment:
+            - Name: ASPNETCORE_ENVIRONMENT
+              Value: !If
+                - IsProduction
+                - Production
+                - !If
+                  - IsStaging
+                  - Staging
+                  - Development
+            - Name: ASPNETCORE_URLS
+              Value: !Sub http://+:${ContainerPort}
+            # Disable .NET telemetry in container
+            - Name: DOTNET_CLI_TELEMETRY_OPTOUT
+              Value: "1"
+            # Enable detailed errors in non-production
+            - Name: ASPNETCORE_DETAILEDERRORS
+              Value: !If
+                - IsProduction
+                - "false"
+                - "true"
+          # Resource limits (soft limits for container)
+          # Hard limits are set at task level via Cpu and Memory
+          Cpu: 0
+          MemoryReservation: !If
+            - IsProduction
+            - 768
+            - 512
+          # Disable privileged mode for security
+          Privileged: false
+          # Read-only root filesystem (recommended for security)
+          # Note: Disabled for .NET as it may need temp file access
+          ReadonlyRootFilesystem: false
+          # Linux parameters
+          LinuxParameters:
+            InitProcessEnabled: true
+          # Ulimits for .NET application
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65536
+              HardLimit: 65536
+      # Task definition tags with ComputeType for cost tracking
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-task-definition
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS EC2 Task Definition
+        - Key: ComputeType
+          Value: ec2
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Task Definition Outputs
+  TaskDefinitionArn:
+    Description: ARN of the ECS EC2 Task Definition
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskDefinitionArn
+
+  TaskDefinitionFamily:
+    Description: Family name of the ECS EC2 Task Definition
+    Value: !Sub ${ProjectName}-${Environment}-ec2-task
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskDefinitionFamily
+
+  TaskDefinitionRevision:
+    Description: Current revision of the EC2 Task Definition
+    Value: !Select [6, !Split [":", !Ref TaskDefinition]]
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskDefinitionRevision
+
+  # Container Configuration Outputs
+  ContainerName:
+    Description: Name of the container in the task definition
+    Value: !Sub ${ProjectName}-${Environment}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ContainerName
+
+  ContainerPort:
+    Description: Port exposed by the container
+    Value: !Ref ContainerPort
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ContainerPort
+
+  # Resource Configuration Outputs
+  TaskCpu:
+    Description: CPU units allocated to the task
+    Value: !Ref TaskCpu
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskCpu
+
+  TaskMemory:
+    Description: Memory (MB) allocated to the task
+    Value: !Ref TaskMemory
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskMemory
+
+  # Network Mode Output
+  NetworkMode:
+    Description: Network mode configured for ALB integration
+    Value: awsvpc
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2NetworkMode
+
+  # Launch Type Output
+  LaunchType:
+    Description: ECS launch type for this task definition
+    Value: EC2
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2LaunchType
+
+  # Health Check Configuration Outputs
+  HealthCheckPath:
+    Description: Health check endpoint path
+    Value: !Ref HealthCheckPath
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2HealthCheckPath
+
+  HealthCheckCommand:
+    Description: Health check command used by the container
+    Value: !Sub "curl -f http://localhost:${ContainerPort}${HealthCheckPath} || exit 1"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2HealthCheckCommand
+
+  # Log Group Outputs
+  TaskLogGroupArn:
+    Description: ARN of the CloudWatch Log Group for EC2 task logs
+    Value: !GetAtt TaskLogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskLogGroupArn
+
+  TaskLogGroupName:
+    Description: Name of the CloudWatch Log Group for EC2 task logs
+    Value: !Ref TaskLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskLogGroupName
+
+  # IAM Role References
+  ExecutionRoleArn:
+    Description: ARN of the ECS Execution Role used by this task
+    Value: !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-execution-role
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskExecutionRoleArn
+
+  TaskRoleArn:
+    Description: ARN of the ECS Task Role used by this task
+    Value: !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-task-role
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2TaskTaskRoleArn
+
+  # Secrets References
+  SecretsConfiguration:
+    Description: Summary of secrets injected into the container
+    Value: !Sub |
+      Secrets injected from Secrets Manager:
+      - ConnectionStrings__PoultrySale: ${ProjectName}/${Environment}/db/connection-strings
+      - ConnectionStrings__MasterDb: ${ProjectName}/${Environment}/db/connection-strings
+
+  # Compute Type Tag
+  ComputeType:
+    Description: Compute type tag value for cost tracking
+    Value: ec2
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ComputeType
