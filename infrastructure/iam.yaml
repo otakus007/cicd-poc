@@ -1,0 +1,582 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  IAM Roles and Policies Stack for CI/CD Pipeline.
+  Creates CodePipeline role, CodeBuild role, ECS execution role, and ECS task role
+  with least-privilege policies following security best practices.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # CodePipeline Service Role
+  # Purpose: Allows CodePipeline to orchestrate the CI/CD workflow
+  # Permissions: CodeBuild operations, ECS service updates, SNS notifications
+  # Requirements: 8.5 (least-privilege), 9.4 (IAM roles)
+  # ---------------------------------------------------------------------------
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-codepipeline-role
+      Description: Service role for CodePipeline to orchestrate CI/CD workflow
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-codepipeline-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CodePipeline Service Role
+
+  CodePipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-codepipeline-policy
+      Roles:
+        - !Ref CodePipelineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # S3 permissions - artifact store and S3 source action
+          - Sid: S3ArtifactAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetBucketVersioning
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource:
+              - !Sub arn:aws:s3:::${ProjectName}-${Environment}-*-artifacts-${AWS::AccountId}
+              - !Sub arn:aws:s3:::${ProjectName}-${Environment}-*-artifacts-${AWS::AccountId}/*
+          # CodeBuild permissions - start and monitor builds
+          - Sid: CodeBuildAccess
+            Effect: Allow
+            Action:
+              - codebuild:StartBuild
+              - codebuild:BatchGetBuilds
+              - codebuild:BatchGetBuildBatches
+              - codebuild:StartBuildBatch
+            Resource:
+              - !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}-${Environment}-*
+          # ECS permissions - deploy action needs full lifecycle access
+          # The ECS deploy provider: describes current task def, registers new one
+          # with updated image, updates service, and monitors rolling deployment
+          - Sid: EcsServiceAccess
+            Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:UpdateService
+              - ecs:DescribeTasks
+              - ecs:ListTasks
+              - ecs:DescribeClusters
+            Resource:
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${ProjectName}-${Environment}-cluster/${ProjectName}-${Environment}-*
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ProjectName}-${Environment}-cluster
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}-${Environment}-cluster/*
+          # ECS task definition — RegisterTaskDefinition and DescribeTaskDefinition
+          # do NOT support resource-level permissions, must use "*"
+          - Sid: EcsTaskDefinitionAccess
+            Effect: Allow
+            Action:
+              - ecs:RegisterTaskDefinition
+              - ecs:DescribeTaskDefinition
+              - ecs:ListTaskDefinitions
+              - ecs:TagResource
+            Resource: "*"
+          # SNS permissions - publish notifications
+          - Sid: SnsPublishAccess
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-*
+          # IAM PassRole - CodePipeline ECS deploy action must pass execution
+          # and task roles when registering new task definitions
+          - Sid: IamPassRoleAccess
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-execution-role
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-task-role
+            Condition:
+              StringLike:
+                iam:PassedToService:
+                  - ecs-tasks.amazonaws.com
+          # ECR permissions - deploy action verifies image exists before updating service
+          - Sid: EcrReadAccess
+            Effect: Allow
+            Action:
+              - ecr:DescribeImages
+              - ecr:GetAuthorizationToken
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchCheckLayerAvailability
+            Resource:
+              - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ProjectName}-${Environment}-*
+          - Sid: EcrAuthForPipeline
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild Service Role
+  # Purpose: Allows CodeBuild to build, test, and push container images
+  # Permissions: CloudWatch Logs, Secrets Manager (PAT), ECR operations, S3 artifacts
+  # Requirements: 8.5 (least-privilege), 9.4 (IAM roles)
+  # ---------------------------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-codebuild-role
+      Description: Service role for CodeBuild to build, test, and push container images
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-codebuild-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CodeBuild Service Role
+
+  CodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-codebuild-policy
+      Roles:
+        - !Ref CodeBuildRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # CloudWatch Logs permissions - create and write logs
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-${Environment}-*
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-${Environment}-*:*
+          # Secrets Manager permissions - retrieve Azure DevOps PAT
+          - Sid: SecretsManagerPatAccess
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/*/azure-devops-pat*
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/azure-devops-pat*
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/azure-devops-pat*
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:azure-devops-pat*
+          # ECR permissions - authenticate and push images
+          - Sid: EcrAuthAccess
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: EcrRepositoryAccess
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:DescribeImages
+              - ecr:DescribeRepositories
+            Resource:
+              - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ProjectName}-${Environment}-*
+          # S3 permissions - artifact storage for pipeline artifacts
+          - Sid: S3ArtifactAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+            Resource:
+              - !Sub arn:aws:s3:::${ProjectName}-${Environment}-*-artifacts-${AWS::AccountId}/*
+          - Sid: S3BucketAccess
+            Effect: Allow
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub arn:aws:s3:::${ProjectName}-${Environment}-*-artifacts-${AWS::AccountId}
+          # VPC permissions - for CodeBuild running in VPC
+          - Sid: VpcAccess
+            Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeDhcpOptions
+              - ec2:DescribeVpcs
+            Resource: "*"
+          - Sid: VpcNetworkInterfaceAccess
+            Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterfacePermission
+            Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+            Condition:
+              StringEquals:
+                ec2:AuthorizedService: codebuild.amazonaws.com
+          # CodeBuild report group permissions
+          - Sid: CodeBuildReportAccess
+            Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:UpdateReport
+              - codebuild:BatchPutTestCases
+              - codebuild:BatchPutCodeCoverages
+            Resource:
+              - !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}-${Environment}-*
+          # SNS permissions - publish governance notifications from lint/contract stages
+          - Sid: SnsPublishAccess
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-*
+
+  # ---------------------------------------------------------------------------
+  # ECS Task Execution Role
+  # Purpose: Allows ECS to pull images and retrieve secrets for task startup
+  # Permissions: AmazonECSTaskExecutionRolePolicy + Secrets Manager for database credentials
+  # Requirements: 8.5 (least-privilege), 9.4 (IAM roles)
+  # ---------------------------------------------------------------------------
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-ecs-execution-role
+      Description: Execution role for ECS tasks to pull images and retrieve secrets
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-execution-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS Task Execution Role
+
+  EcsExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-ecs-execution-secrets-policy
+      Roles:
+        - !Ref EcsExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Secrets Manager permissions - retrieve database credentials
+          - Sid: SecretsManagerDatabaseAccess
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/*/db/*
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/db/*
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/db/*
+          # KMS permissions - decrypt secrets if using CMK
+          - Sid: KmsDecryptAccess
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource:
+              - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+
+  # ---------------------------------------------------------------------------
+  # EC2 Instance Role
+  # Purpose: Allows EC2 instances to register with ECS cluster and pull images from ECR
+  # Permissions: ECS container service, SSM for instance management, ECR pull
+  # Requirements: 1.7 (EC2-based ECS deployment)
+  # ---------------------------------------------------------------------------
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-ec2-instance-role
+      Description: Instance role for EC2 instances to register with ECS and pull images from ECR
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ec2-instance-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: EC2 Instance Role for ECS
+        - Key: ComputeType
+          Value: ec2
+
+  Ec2InstanceRoleEcrPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-ec2-ecr-pull-policy
+      Roles:
+        - !Ref Ec2InstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # ECR permissions - authenticate and pull images
+          - Sid: EcrAuthAccess
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+          - Sid: EcrPullAccess
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:DescribeImages
+              - ecr:DescribeRepositories
+            Resource:
+              - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ProjectName}-${Environment}-*
+
+  # ---------------------------------------------------------------------------
+  # EC2 Instance Profile
+  # Purpose: Allows EC2 instances to assume the EC2 instance role
+  # Used by: Launch Template in ecs-ec2-cluster.yaml
+  # Requirements: 1.7 (EC2-based ECS deployment)
+  # ---------------------------------------------------------------------------
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-${Environment}-ec2-instance-profile
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  # ---------------------------------------------------------------------------
+  # ECS Task Role
+  # Purpose: Allows the application running in ECS tasks to access AWS services
+  # Permissions: CloudWatch Logs, SSM Messages for ECS Exec
+  # Requirements: 8.5 (least-privilege), 9.4 (IAM roles)
+  # ---------------------------------------------------------------------------
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-ecs-task-role
+      Description: Task role for application runtime permissions in ECS
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-task-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECS Task Role
+
+  EcsTaskRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-ecs-task-policy
+      Roles:
+        - !Ref EcsTaskRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # CloudWatch Logs permissions - application logging
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}:*
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}-*:*
+          # SSM Messages permissions - ECS Exec for debugging
+          - Sid: SsmMessagesAccess
+            Effect: Allow
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: "*"
+          # X-Ray permissions - distributed tracing (optional)
+          - Sid: XRayAccess
+            Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+              - xray:GetSamplingStatisticSummaries
+            Resource: "*"
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # CodePipeline Role Outputs
+  CodePipelineRoleArn:
+    Description: CodePipeline Service Role ARN
+    Value: !GetAtt CodePipelineRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CodePipelineRoleArn
+
+  CodePipelineRoleName:
+    Description: CodePipeline Service Role Name
+    Value: !Ref CodePipelineRole
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CodePipelineRoleName
+
+  # CodeBuild Role Outputs
+  CodeBuildRoleArn:
+    Description: CodeBuild Service Role ARN
+    Value: !GetAtt CodeBuildRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CodeBuildRoleArn
+
+  CodeBuildRoleName:
+    Description: CodeBuild Service Role Name
+    Value: !Ref CodeBuildRole
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CodeBuildRoleName
+
+  # ECS Execution Role Outputs
+  EcsExecutionRoleArn:
+    Description: ECS Task Execution Role ARN
+    Value: !GetAtt EcsExecutionRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsExecutionRoleArn
+
+  EcsExecutionRoleName:
+    Description: ECS Task Execution Role Name
+    Value: !Ref EcsExecutionRole
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsExecutionRoleName
+
+  # ECS Task Role Outputs
+  EcsTaskRoleArn:
+    Description: ECS Task Role ARN
+    Value: !GetAtt EcsTaskRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsTaskRoleArn
+
+  EcsTaskRoleName:
+    Description: ECS Task Role Name
+    Value: !Ref EcsTaskRole
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsTaskRoleName
+
+  # EC2 Instance Role Outputs
+  Ec2InstanceRoleArn:
+    Description: EC2 Instance Role ARN for ECS
+    Value: !GetAtt Ec2InstanceRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2InstanceRoleArn
+
+  Ec2InstanceRoleName:
+    Description: EC2 Instance Role Name
+    Value: !Ref Ec2InstanceRole
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2InstanceRoleName
+
+  # EC2 Instance Profile Outputs
+  Ec2InstanceProfileArn:
+    Description: EC2 Instance Profile ARN for ECS Launch Template
+    Value: !GetAtt Ec2InstanceProfile.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2InstanceProfileArn
+
+  Ec2InstanceProfileName:
+    Description: EC2 Instance Profile Name
+    Value: !Ref Ec2InstanceProfile
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2InstanceProfileName
