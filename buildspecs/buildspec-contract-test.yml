@@ -1,0 +1,258 @@
+# BuildSpec for API Contract Testing Stage (Dredd)
+# Validates deployed API against OpenAPI specification using Dredd
+#
+# IMPORTANT: All contract mismatches are reported as WARNINGS only.
+# This buildspec NEVER fails the build - all issues are collected and reported.
+# Rationale: API specifications may depend on partner specifications,
+# so contract violations should be reported but not block deployments.
+#
+# Validates: Requirements 3.1, 3.2, 3.7
+# - 3.1: Pipeline SHALL include API governance stage for OpenAPI validation
+# - 3.2: API governance SHALL use Dredd for contract testing
+# - 3.7: API governance violations SHALL be reported as warnings only (no build rejection)
+
+version: 0.2
+
+env:
+  variables:
+    # API endpoint to test against - should be set by pipeline
+    API_ENDPOINT: "${API_GATEWAY_ENDPOINT}"
+    # Optional test token for authenticated endpoints
+    TEST_TOKEN: ""
+    # Disable telemetry for faster execution
+    NPM_CONFIG_UPDATE_NOTIFIER: "false"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - echo "Installing pnpm package manager..."
+      - export PNPM_HOME="/root/.local/share/pnpm"
+      - export PATH="$PNPM_HOME:$PATH"
+      - npm install -g pnpm
+      - pnpm setup || true
+      - echo "Installing Dredd CLI for API contract testing..."
+      - pnpm install -g dredd
+      - echo "Installing jq for JSON processing..."
+      - yum install -y jq || apt-get install -y jq || echo "jq may already be installed"
+      - echo "Verifying Dredd installation..."
+      - dredd --version
+
+  pre_build:
+    commands:
+      - echo "============================================"
+      - echo "API Contract Testing Stage (Dredd)"
+      - echo "============================================"
+      - 'echo "Build ID: ${CODEBUILD_BUILD_ID}"'
+      - 'echo "Source Version: ${CODEBUILD_RESOLVED_SOURCE_VERSION}"'
+      - 'echo "API Endpoint: ${API_ENDPOINT}"'
+      - echo "============================================"
+      - echo "Checking for required files..."
+      - |
+        # Auto-discover OpenAPI spec: check env var, then common locations
+        SPEC_FILE=""
+        if [ -n "${OPENAPI_SPEC_PATH:-}" ] && [ -f "${OPENAPI_SPEC_PATH}" ]; then
+          SPEC_FILE="${OPENAPI_SPEC_PATH}"
+        else
+          for candidate in \
+            "./swagger.json" \
+            "./openapi.json" \
+            "./openapi.yaml" \
+            "./openapi.yml" \
+            "./docs/swagger.json" \
+            "./docs/openapi.json" \
+            "./docs/openapi.yaml" \
+            ; do
+            if [ -f "$candidate" ]; then
+              SPEC_FILE="$candidate"
+              break
+            fi
+          done
+          if [ -z "$SPEC_FILE" ]; then
+            SPEC_FILE=$(find . -maxdepth 3 -name "swagger.json" -o -name "openapi.json" -o -name "openapi.yaml" | head -1)
+          fi
+        fi
+        export SPEC_FILE
+      - |
+        # Check for OpenAPI specification
+        if [ -n "$SPEC_FILE" ]; then
+          echo "✓ Found OpenAPI specification: $SPEC_FILE"
+        else
+          echo "⚠️  No OpenAPI specification found in project"
+          echo "Set OPENAPI_SPEC_PATH env var in CodeBuild project to specify a custom location"
+          echo "Contract testing will be skipped."
+        fi
+      - |
+        # Check for Dredd hooks file
+        if [ -f "./dredd-hooks.js" ]; then
+          echo "✓ Found Dredd hooks: ./dredd-hooks.js"
+        else
+          echo "⚠️  Dredd hooks file not found at ./dredd-hooks.js"
+          echo "Creating minimal hooks file..."
+          cat > dredd-hooks.js << 'HOOKS_EOF'
+        const hooks = require("hooks");
+        const fs = require("fs");
+        let warnings = [];
+        hooks.afterEach((transaction, done) => {
+          if (transaction.real && transaction.real.statusCode !== transaction.expected.statusCode) {
+            warnings.push({
+              endpoint: transaction.name,
+              expected: transaction.expected.statusCode,
+              actual: transaction.real.statusCode,
+              message: `Status mismatch: expected ${transaction.expected.statusCode}, got ${transaction.real.statusCode}`,
+              timestamp: new Date().toISOString()
+            });
+            transaction.fail = false;
+          }
+          done();
+        });
+        hooks.afterAll((transactions, done) => {
+          const report = { timestamp: new Date().toISOString(), totalWarnings: warnings.length, warnings: warnings };
+          fs.writeFileSync("dredd-warnings.json", JSON.stringify(report, null, 2));
+          done();
+        });
+        HOOKS_EOF
+        fi
+      - |
+        # Check for Dredd configuration file
+        if [ -f "./dredd.yml" ]; then
+          echo "✓ Found Dredd configuration: ./dredd.yml"
+        else
+          echo "ℹ️  No dredd.yml found, will use command line arguments"
+        fi
+
+  build:
+    commands:
+      # Run Dredd contract tests - all failures converted to warnings via hooks
+      - echo "Running Dredd API contract tests (warnings only)..."
+      - |
+        if [ -n "$SPEC_FILE" ]; then
+          # Run Dredd with hooks that convert failures to warnings
+          # The '|| true' ensures the command doesn't fail the build even if Dredd returns non-zero
+          dredd "$SPEC_FILE" "${API_ENDPOINT}" \
+            --hookfiles=./dredd-hooks.js \
+            --reporter=junit \
+            --output=dredd-report.xml \
+            --loglevel=warning \
+            --details || true
+
+          echo "✓ Dredd contract testing completed"
+        else
+          echo "⚠️  Skipping contract tests - OpenAPI specification not found"
+          # Create empty report files for consistency
+          echo '<?xml version="1.0" encoding="UTF-8"?><testsuites><testsuite name="dredd" tests="0" failures="0" errors="0" skipped="0"></testsuite></testsuites>' > dredd-report.xml
+          cat > dredd-warnings.json << EOF
+        {
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "totalWarnings": 0,
+          "warnings": [],
+          "status": "SKIPPED",
+          "note": "Contract testing skipped - no OpenAPI specification found. Set OPENAPI_SPEC_PATH env var to specify location."
+        }
+        EOF
+        fi
+
+      # Report summary from warnings JSON
+      - |
+        echo ""
+        echo "============================================"
+        echo "Contract Testing Report"
+        echo "============================================"
+
+        if [ -f "dredd-warnings.json" ]; then
+          # Parse the warnings report
+          TOTAL_WARNINGS=$(cat dredd-warnings.json | jq '.totalWarnings // .summary.warningsCount // 0')
+          STATUS=$(cat dredd-warnings.json | jq -r '.status // "UNKNOWN"')
+
+          echo "Status: $STATUS"
+          echo "Warnings: $TOTAL_WARNINGS"
+          echo "--------------------------------------------"
+
+          # Show summary statistics if available
+          if cat dredd-warnings.json | jq -e '.summary' > /dev/null 2>&1; then
+            TOTAL=$(cat dredd-warnings.json | jq '.summary.total // 0')
+            PASSED=$(cat dredd-warnings.json | jq '.summary.passed // 0')
+            FAILED=$(cat dredd-warnings.json | jq '.summary.failed // 0')
+            SKIPPED=$(cat dredd-warnings.json | jq '.summary.skipped // 0')
+
+            echo "Total Tests:  $TOTAL"
+            echo "Passed:       $PASSED"
+            echo "Warnings:     $FAILED"
+            echo "Skipped:      $SKIPPED"
+            echo "--------------------------------------------"
+          fi
+
+          # List warnings if any exist
+          if [ "$TOTAL_WARNINGS" -gt 0 ]; then
+            echo ""
+            echo "Warning Details:"
+            echo "--------------------------------------------"
+            cat dredd-warnings.json | jq -r '.warnings[] | "  ⚠️  [\(.method // "?")] \(.endpoint // .name): \(.message)"' 2>/dev/null || echo "  (Unable to parse warning details)"
+            echo "--------------------------------------------"
+          fi
+        else
+          echo "No warnings report generated"
+        fi
+
+        echo ""
+        echo "============================================"
+        echo "⚠️  All mismatches reported as warnings only"
+        echo "✓ Build will proceed regardless of contract violations"
+        echo "============================================"
+
+      # Generate summary JSON for downstream stages
+      - |
+        if [ -f "dredd-warnings.json" ]; then
+          TOTAL_WARNINGS=$(cat dredd-warnings.json | jq '.totalWarnings // .summary.warningsCount // 0')
+          STATUS=$(cat dredd-warnings.json | jq -r '.status // "COMPLETED"')
+
+          cat > contract-test-summary.json << EOF
+        {
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "buildId": "${CODEBUILD_BUILD_ID}",
+          "sourceVersion": "${CODEBUILD_RESOLVED_SOURCE_VERSION}",
+          "apiEndpoint": "${API_ENDPOINT}",
+          "specificationFile": "${SPEC_FILE:-none}",
+          "results": {
+            "totalWarnings": $TOTAL_WARNINGS,
+            "status": "$STATUS"
+          },
+          "buildProceed": true,
+          "note": "All contract violations reported as warnings only - build never fails due to API contract mismatches"
+        }
+        EOF
+          echo "✓ Generated contract-test-summary.json"
+        fi
+
+  post_build:
+    commands:
+      - echo "============================================"
+      - echo "Contract Testing Stage Complete"
+      - echo "============================================"
+      - 'echo "Artifacts generated:"'
+      - echo "  - dredd-report.xml (JUnit test results)"
+      - echo "  - dredd-warnings.json (detailed warnings report)"
+      - echo "  - contract-test-summary.json (summary for downstream stages)"
+      - echo "============================================"
+      # Always exit 0 to ensure pipeline continues
+      - exit 0
+
+reports:
+  dredd-reports:
+    files:
+      - dredd-report.xml
+    file-format: JunitXml
+
+artifacts:
+  files:
+    - dredd-report.xml
+    - dredd-warnings.json
+    - contract-test-summary.json
+  name: contract-test-reports
+  discard-paths: yes
+
+cache:
+  paths:
+    # Cache pnpm store for faster subsequent builds
+    - "/root/.local/share/pnpm/store/**/*"
