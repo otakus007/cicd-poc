@@ -1,0 +1,4 @@
+./scripts/deploy.sh \
+  -e dev \
+  -b japfa-api-cfn-us-east-1 \
+  --region us-east-1
