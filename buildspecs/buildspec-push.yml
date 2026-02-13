@@ -1,0 +1,69 @@
+# buildspec-push.yml — Generic ECR Push
+# ============================================================================
+# Generic buildspec that works for ANY project. Rebuilds Docker image from
+# source artifacts, pushes to ECR, and outputs imagedefinitions.json for ECS.
+#
+# Injected env vars (from project.yaml CodeBuild config):
+#   AWS_ACCOUNT_ID, AWS_REGION, ECR_REPO, SERVICE_NAME, ENVIRONMENT
+#
+# Convention: Dockerfile must exist at the repo root.
+# Override: Set DOCKERFILE_PATH env var in CodeBuild project config.
+# ============================================================================
+
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "Authenticating with Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - echo "ECR authentication successful"
+
+      # Resolve image tag
+      - |
+        IMAGE_TAG=""
+        if [ -n "${CODEBUILD_RESOLVED_SOURCE_VERSION}" ]; then
+          IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION}" | cut -c1-8)
+        elif [ -f image-metadata.json ]; then
+          IMAGE_TAG=$(python3 -c "import json; print(json.load(open('image-metadata.json'))['shortSha'])" 2>/dev/null || true)
+        fi
+        if [ -z "$IMAGE_TAG" ]; then
+          IMAGE_TAG="b$(date +%Y%m%d%H%M%S)"
+        fi
+        export IMAGE_TAG
+      - 'echo "Image tag: $IMAGE_TAG"'
+
+  build:
+    commands:
+      - DOCKERFILE_PATH="${DOCKERFILE_PATH:-Dockerfile}"
+
+      - |
+        if [ ! -f "$DOCKERFILE_PATH" ]; then
+          echo "ERROR: Dockerfile not found at $DOCKERFILE_PATH"
+          exit 1
+        fi
+
+      - ECR_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO
+
+      - echo "Building and pushing Docker image..."
+      - |
+        docker build \
+          -t $ECR_URI:$IMAGE_TAG \
+          -t $ECR_URI:latest \
+          -f "$DOCKERFILE_PATH" \
+          .
+
+      - docker push $ECR_URI:$IMAGE_TAG
+      - docker push $ECR_URI:latest
+      - echo "Docker images pushed to ECR"
+
+  post_build:
+    commands:
+      - ECR_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG
+      # Container name matches ECS task definition: ${ServiceName}-container
+      - printf '[{"name":"%s-container","imageUri":"%s"}]' "$SERVICE_NAME" "$ECR_IMAGE" > imagedefinitions.json
+      - 'echo "Image: $(cat imagedefinitions.json)"'
+
+artifacts:
+  files:
+    - imagedefinitions.json
