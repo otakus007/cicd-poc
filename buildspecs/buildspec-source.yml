@@ -1,0 +1,187 @@
+# buildspec-source.yml
+# Source Stage BuildSpec for Azure DevOps Integration
+#
+# This buildspec retrieves source code from Azure DevOps using PAT authentication.
+# The PAT is securely stored in AWS Secrets Manager and retrieved at runtime.
+#
+# Requirements:
+# - 1.1: Pipeline connects to Azure DevOps using PAT authentication exclusively
+# - 1.3: CodeBuild retrieves PAT from Secrets Manager and clones repository directly
+# - 8.1: Pipeline retrieves Azure DevOps PAT from AWS Secrets Manager at runtime
+
+version: 0.2
+
+# Environment variables are set in the CodeBuild project configuration:
+# AZURE_DEVOPS_ORGANIZATION, AZURE_DEVOPS_PROJECT, AZURE_DEVOPS_REPOSITORY, BRANCH_NAME
+# PROJECT_NAME, ENVIRONMENT, SERVICE_NAME
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Verifying required packages..."
+      - git --version
+      - echo "Git available"
+
+  pre_build:
+    commands:
+      - echo "Configuring git credentials for Azure DevOps..."
+
+      # Validate required environment variables
+      - |
+        if [ -z "$AZURE_DEVOPS_ORGANIZATION" ]; then
+          echo "ERROR: AZURE_DEVOPS_ORGANIZATION environment variable is not set"
+          exit 1
+        fi
+      - |
+        if [ -z "$AZURE_DEVOPS_PROJECT" ]; then
+          echo "ERROR: AZURE_DEVOPS_PROJECT environment variable is not set"
+          exit 1
+        fi
+      - |
+        if [ -z "$AZURE_DEVOPS_REPOSITORY" ]; then
+          echo "ERROR: AZURE_DEVOPS_REPOSITORY environment variable is not set"
+          exit 1
+        fi
+      - |
+        if [ -z "$BRANCH_NAME" ]; then
+          echo "ERROR: BRANCH_NAME environment variable is not set"
+          exit 1
+        fi
+
+      # Validate PAT was retrieved from Secrets Manager
+      # Note: We check if the variable exists but NEVER log its value
+      - |
+        SECRET_NAME="${PROJECT_NAME}/${ENVIRONMENT}/${SERVICE_NAME}/azure-devops-pat"
+        echo "Retrieving PAT from Secrets Manager: $SECRET_NAME"
+        AZURE_DEVOPS_PAT=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query 'SecretString' --output text | python3 -c "import sys,json; print(json.load(sys.stdin)['pat'])")
+        if [ -z "$AZURE_DEVOPS_PAT" ] || [ "$AZURE_DEVOPS_PAT" = "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT" ]; then
+          echo "ERROR: Azure DevOps PAT is not configured or still has placeholder value"
+          echo "Please update the secret: aws secretsmanager put-secret-value --secret-id $SECRET_NAME --secret-string '{\"pat\":\"YOUR_PAT\"}'"
+          exit 1
+        fi
+        export AZURE_DEVOPS_PAT
+      - echo "PAT successfully retrieved from Secrets Manager"
+      # Configure git credential helper to use stored credentials
+      - git config --global credential.helper store
+
+      # Store credentials securely for Azure DevOps
+      # The PAT is used as the password with 'pat' as the username
+      # IMPORTANT: This writes to a file that is not logged
+      - echo "https://pat:${AZURE_DEVOPS_PAT}@dev.azure.com" > ~/.git-credentials
+      - chmod 600 ~/.git-credentials
+
+      # Configure git user for any potential commits
+      - git config --global user.email "codebuild@pipeline.local"
+      - git config --global user.name "AWS CodeBuild"
+
+      # Log configuration (without sensitive data)
+      - 'echo "Git credentials configured for Azure DevOps organization: $AZURE_DEVOPS_ORGANIZATION"'
+      - 'echo "Target repository: $AZURE_DEVOPS_PROJECT/$AZURE_DEVOPS_REPOSITORY"'
+      - 'echo "Target branch: $BRANCH_NAME"'
+
+  build:
+    commands:
+      - echo "Cloning repository from Azure DevOps..."
+
+      # Construct the repository URL
+      # Note: If project name contains % it's already URL-encoded, don't double-encode
+      - |
+        if [[ "$AZURE_DEVOPS_PROJECT" == *"%"* ]]; then
+          echo "Project name already URL-encoded, using as-is"
+          ENCODED_PROJECT="$AZURE_DEVOPS_PROJECT"
+        else
+          echo "URL-encoding project name..."
+          ENCODED_PROJECT=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$AZURE_DEVOPS_PROJECT', safe=''))")
+        fi
+        REPO_URL="https://dev.azure.com/${AZURE_DEVOPS_ORGANIZATION}/${ENCODED_PROJECT}/_git/${AZURE_DEVOPS_REPOSITORY}"
+        echo "Repository URL: $REPO_URL"
+        export ENCODED_PROJECT REPO_URL
+
+      # Clone the repository with error handling
+      # Using --single-branch to only fetch the target branch for efficiency
+      - |
+        if ! git clone --single-branch --branch "$BRANCH_NAME" "$REPO_URL" source 2>&1; then
+          echo "============================================"
+          echo "ERROR: Failed to clone repository"
+          echo "============================================"
+          echo "Possible causes:"
+          echo "  1. Invalid or expired PAT"
+          echo "  2. PAT lacks required permissions (Code: Read)"
+          echo "  3. Repository URL is incorrect"
+          echo "  4. Branch '$BRANCH_NAME' does not exist"
+          echo "  5. Network connectivity issues"
+          echo "============================================"
+          echo "Please verify:"
+          echo "  - PAT in Secrets Manager is valid and not expired"
+          echo "  - PAT has 'Code (Read)' permission"
+          echo "  - Organization: $AZURE_DEVOPS_ORGANIZATION"
+          echo "  - Project: $AZURE_DEVOPS_PROJECT"
+          echo "  - Repository: $AZURE_DEVOPS_REPOSITORY"
+          echo "  - Branch: $BRANCH_NAME"
+          echo "============================================"
+          exit 1
+        fi
+
+      - echo "Repository cloned successfully"
+
+      # Initialize and update git submodules
+      - cd source
+      - echo "Initializing git submodules..."
+      - git submodule init
+      - git submodule update --recursive
+      - echo "Git submodules initialized"
+      - 'echo "Current branch: $(git branch --show-current)"'
+      - 'echo "Latest commit: $(git log -1 --oneline)"'
+      - 'echo "Commit SHA: $(git rev-parse HEAD)"'
+
+      # Store commit information for downstream stages
+      - git rev-parse HEAD > ../commit-sha.txt
+      - git log -1 --format="%H%n%an%n%ae%n%s" > ../commit-info.txt
+
+      # Copy infra buildspecs into source so downstream stages can use them
+      - cp -r ../buildspecs ./buildspecs
+      # Copy shared governance config files (ruleset, dredd config, hooks) if present in trigger
+      - cp ../.spectral.yml ./ 2>/dev/null || true
+      - cp ../.spectral.yaml ./ 2>/dev/null || true
+      - cp ../dredd.yml ./ 2>/dev/null || true
+      - cp ../dredd-hooks.js ./ 2>/dev/null || true
+
+  post_build:
+    commands:
+      - echo "Source stage completed successfully"
+
+      # Clean up credentials file for security
+      - rm -f ~/.git-credentials
+      - echo "Credentials cleaned up"
+
+      # Display summary
+      - echo "============================================"
+      - echo "Source Stage Summary"
+      - echo "============================================"
+      - 'echo "Organization: $AZURE_DEVOPS_ORGANIZATION"'
+      - 'echo "Project: $AZURE_DEVOPS_PROJECT"'
+      - 'echo "Repository: $AZURE_DEVOPS_REPOSITORY"'
+      - 'echo "Branch: $BRANCH_NAME"'
+      - 'echo "Commit SHA: $(cat ../commit-sha.txt)"'
+      - echo "============================================"
+
+artifacts:
+  files:
+    # Include all source files
+    - "**/*"
+  # Set base directory to the cloned source
+  base-directory: source
+  # Artifact name for reference in subsequent stages
+  name: source-output
+  # Exclude git metadata to reduce artifact size
+  exclude-paths:
+    - ".git/**/*"
+
+# Cache configuration for faster subsequent builds
+cache:
+  paths:
+    # Cache git objects if needed for incremental clones
+    - "/root/.gitconfig"
+
