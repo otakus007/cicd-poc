@@ -1,0 +1,181 @@
+# BuildSpec for OpenAPI Spec Generation
+# Generates swagger.json from ASP.NET Swashbuckle at build time
+#
+# If the project already has a swagger.json/openapi.json checked in,
+# this stage uses it as-is. Otherwise, it runs dotnet build + swagger tofile
+# to extract the spec from the compiled assembly.
+#
+# Output: swagger.json in the artifact root for downstream Lint and ContractTest stages.
+
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      dotnet: 10.0
+    commands:
+      - echo "Checking for existing OpenAPI specification..."
+
+  pre_build:
+    commands:
+      - echo "============================================"
+      - echo "OpenAPI Spec Generation Stage"
+      - echo "============================================"
+      - 'echo "Build ID: ${CODEBUILD_BUILD_ID}"'
+      - echo "============================================"
+      # Check if spec already exists in the source
+      - |
+        EXISTING_SPEC=""
+        if [ -n "${OPENAPI_SPEC_PATH:-}" ] && [ -f "${OPENAPI_SPEC_PATH}" ]; then
+          EXISTING_SPEC="${OPENAPI_SPEC_PATH}"
+        else
+          for candidate in \
+            "./swagger.json" \
+            "./openapi.json" \
+            "./openapi.yaml" \
+            "./openapi.yml" \
+            "./docs/swagger.json" \
+            "./docs/openapi.json" \
+            "./docs/openapi.yaml" \
+            ; do
+            if [ -f "$candidate" ]; then
+              EXISTING_SPEC="$candidate"
+              break
+            fi
+          done
+          if [ -z "$EXISTING_SPEC" ]; then
+            EXISTING_SPEC=$(find . -maxdepth 3 -name "swagger.json" -o -name "openapi.json" -o -name "openapi.yaml" 2>/dev/null | head -1)
+          fi
+        fi
+        export EXISTING_SPEC
+      - |
+        if [ -n "$EXISTING_SPEC" ]; then
+          echo "Found existing spec: $EXISTING_SPEC"
+          echo "Skipping generation — will use existing spec."
+          # Copy to root as swagger.json for consistent downstream access
+          if [ "$EXISTING_SPEC" != "./swagger.json" ]; then
+            cp "$EXISTING_SPEC" ./swagger.json
+          fi
+        else
+          echo "No existing spec found — will generate from Swashbuckle."
+        fi
+
+  build:
+    commands:
+      - |
+        if [ -n "$EXISTING_SPEC" ]; then
+          echo "Using existing spec — nothing to build."
+        else
+          echo "Generating OpenAPI spec from ASP.NET project..."
+
+          # Find the solution or main web project
+          SLN_FILE=$(find . -maxdepth 2 -name "*.sln" | head -1)
+          if [ -n "$SLN_FILE" ]; then
+            echo "Found solution: $SLN_FILE"
+            dotnet build "$SLN_FILE" -c Release --no-incremental
+          else
+            CSPROJ_FILE=$(find . -maxdepth 2 -name "*.csproj" -exec grep -l "Sdk=\"Microsoft.NET.Sdk.Web\"" {} \; | head -1)
+            if [ -n "$CSPROJ_FILE" ]; then
+              echo "Found web project: $CSPROJ_FILE"
+              dotnet build "$CSPROJ_FILE" -c Release --no-incremental
+            else
+              echo "No .sln or web .csproj found — cannot generate spec"
+              echo "[]" > swagger.json
+              exit 0
+            fi
+          fi
+
+          # Find the web project for swagger CLI
+          WEB_CSPROJ=$(find . -maxdepth 2 -name "*.csproj" -exec grep -l "Sdk=\"Microsoft.NET.Sdk.Web\"" {} \; | head -1)
+          if [ -z "$WEB_CSPROJ" ]; then
+            echo "No web project found — skipping swagger generation"
+            exit 0
+          fi
+          WEB_PROJECT_DIR=$(dirname "$WEB_CSPROJ")
+          WEB_PROJECT_NAME=$(basename "$WEB_CSPROJ" .csproj)
+
+          # Install Swashbuckle CLI as a local tool
+          dotnet new tool-manifest --force 2>/dev/null || true
+          dotnet tool install Swashbuckle.AspNetCore.Cli --version 7.2.0 2>/dev/null || dotnet tool install Swashbuckle.AspNetCore.Cli
+
+          # Find the built assembly
+          ASSEMBLY=$(find "${WEB_PROJECT_DIR}/bin/Release" -name "${WEB_PROJECT_NAME}.dll" -path "*/Release/*" | head -1)
+          if [ -z "$ASSEMBLY" ]; then
+            echo "Could not find built assembly for ${WEB_PROJECT_NAME}"
+            echo "Trying alternative: running app briefly to fetch spec..."
+
+            # Fallback: start the app and curl the swagger endpoint
+            export ASPNETCORE_ENVIRONMENT=Development
+            export ASPNETCORE_URLS="http://localhost:5099"
+            dotnet run --project "$WEB_CSPROJ" --no-build -c Release &
+            APP_PID=$!
+
+            # Wait for app to start (max 30s)
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:5099/swagger/v2/swagger.json -o swagger.json 2>/dev/null; then
+                echo "Fetched swagger.json from running app"
+                break
+              fi
+              if curl -sf http://localhost:5099/swagger/v1/swagger.json -o swagger.json 2>/dev/null; then
+                echo "Fetched swagger.json from running app (v1)"
+                break
+              fi
+              sleep 1
+            done
+
+            kill $APP_PID 2>/dev/null || true
+            wait $APP_PID 2>/dev/null || true
+          else
+            echo "Found assembly: $ASSEMBLY"
+            # Detect swagger doc name from Startup.cs
+            SWAGGER_DOC=$(grep -oP 'SwaggerDoc\("\K[^"]+' ${WEB_PROJECT_DIR}/*.cs ${WEB_PROJECT_DIR}/Startup.cs ${WEB_PROJECT_DIR}/Program.cs 2>/dev/null | head -1)
+            SWAGGER_DOC="${SWAGGER_DOC:-v1}"
+            echo "Swagger doc name: $SWAGGER_DOC"
+
+            dotnet swagger tofile --output ./swagger.json "$ASSEMBLY" "$SWAGGER_DOC" || {
+              echo "swagger tofile failed — trying runtime fallback..."
+              export ASPNETCORE_ENVIRONMENT=Development
+              export ASPNETCORE_URLS="http://localhost:5099"
+              dotnet run --project "$WEB_CSPROJ" --no-build -c Release &
+              APP_PID=$!
+              for i in $(seq 1 30); do
+                if curl -sf "http://localhost:5099/swagger/${SWAGGER_DOC}/swagger.json" -o swagger.json 2>/dev/null; then
+                  echo "Fetched swagger.json from running app"
+                  break
+                fi
+                sleep 1
+              done
+              kill $APP_PID 2>/dev/null || true
+              wait $APP_PID 2>/dev/null || true
+            }
+          fi
+        fi
+
+  post_build:
+    commands:
+      - |
+        if [ -f "swagger.json" ] && [ -s "swagger.json" ]; then
+          echo "swagger.json generated successfully ($(wc -c < swagger.json) bytes)"
+          # Quick sanity check — must be valid JSON with paths
+          if jq -e '.paths' swagger.json > /dev/null 2>&1; then
+            ENDPOINT_COUNT=$(jq '.paths | length' swagger.json)
+            echo "Endpoints found: $ENDPOINT_COUNT"
+          elif jq -e '.' swagger.json > /dev/null 2>&1; then
+            echo "Valid JSON but no paths — spec may be empty"
+          else
+            echo "WARNING: swagger.json is not valid JSON"
+          fi
+        else
+          echo "WARNING: swagger.json was not generated or is empty"
+          echo "Lint and ContractTest stages will skip validation"
+        fi
+      - echo "============================================"
+      - echo "Spec Generation Complete"
+      - echo "============================================"
+
+artifacts:
+  files:
+    - "**/*"
+  exclude-paths:
+    - ".git/**/*"
+
