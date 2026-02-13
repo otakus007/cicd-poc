@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Minimal Monitoring Stack for Shared Infrastructure.
+  Only includes SNS topic and basic pipeline monitoring.
+  Per-project alarms should be added to project.yaml.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  ProjectName:
+    Type: String
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+
+  ClusterName:
+    Type: String
+    Description: ECS Cluster Name for dashboard metrics
+
+Conditions:
+  HasClusterName: !Not [!Equals [!Ref ClusterName, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # SNS Topic - Central notification hub for all projects
+  # ---------------------------------------------------------------------------
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Environment}-notifications
+      DisplayName: !Sub "${ProjectName} ${Environment} Platform Notifications"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-notifications
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # SNS Topic Policy - Allow CloudWatch Events and CodePipeline to publish
+  # ---------------------------------------------------------------------------
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchEventsPublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}-${Environment}-*
+          - Sid: AllowCodePipelinePublish
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Dashboard - Platform overview
+  # ---------------------------------------------------------------------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: HasClusterName
+    Properties:
+      DashboardName: !Sub ${ProjectName}-${Environment}-platform
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "# ${ProjectName} ${Environment} Platform Dashboard\n\n**Cluster**: ${ClusterName} | **Region**: ${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 1,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "ECS Cluster CPU Utilization",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ClusterName", "${ClusterName}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 1,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "ECS Cluster Memory Utilization",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ECS", "MemoryUtilization", "ClusterName", "${ClusterName}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 7,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "title": "Running Tasks Count",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "${ClusterName}"]
+                ],
+                "period": 300,
+                "stat": "Average"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  NotificationTopicArn:
+    Description: SNS Topic ARN for notifications (all projects should use this)
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-NotificationTopicArn
+
+  NotificationTopicName:
+    Description: SNS Topic Name
+    Value: !GetAtt NotificationTopic.TopicName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-NotificationTopicName
+
+  DashboardName:
+    Description: CloudWatch Dashboard Name
+    Condition: HasClusterName
+    Value: !Ref Dashboard
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DashboardName
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Condition: HasClusterName
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DashboardUrl
