@@ -1,0 +1,12 @@
+./scripts/deploy-project.sh \
+  -s hsbc-va \
+  -o trungvudinh \
+  -p "5.%20Cash%20Collection" \
+  -r api-core \
+  --branch feature/hsbc \
+  --region us-east-1 \
+  -b japfa-api-cfn-us-east-1 \
+  -e dev \
+  --path "/virtual-accounts/" \
+  --path-base "/virtual-accounts/hsbc/v2" \
+  --health-check "/JapfaHsbc/transactions"
