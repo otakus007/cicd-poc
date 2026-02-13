@@ -1,0 +1,52 @@
+# Dredd API Contract Testing Configuration
+# All failures are converted to warnings via hooks - build never fails due to contract mismatches
+# Requirements: 3.1, 3.2, 3.7
+
+# Core settings
+dry-run: false
+hookfiles: ./dredd-hooks.js
+language: nodejs
+sandbox: false
+server: null
+server-wait: 3
+init: false
+custom: {}
+
+# Test selection
+names: false
+only: []
+method: []
+path: []
+sorted: false
+
+# Reporters - JUnit for CI/CD integration
+reporter:
+  - junit
+output:
+  - dredd-report.xml
+
+# Request configuration
+header: []
+user: null
+
+# Output settings
+inline-errors: false
+details: true
+color: true
+loglevel: warning
+
+# Hooks worker configuration
+hooks-worker-timeout: 5000
+hooks-worker-connect-timeout: 1500
+hooks-worker-connect-retry: 500
+hooks-worker-after-connect-wait: 100
+hooks-worker-term-timeout: 5000
+hooks-worker-term-retry: 500
+hooks-worker-handler-host: 127.0.0.1
+hooks-worker-handler-port: 61321
+
+# API specification and endpoint
+# Note: These are overridden via command line arguments in the buildspec
+config: ./dredd.yml
+blueprint: ./swagger.json
+endpoint: http://localhost:5000
