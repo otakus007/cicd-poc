@@ -1,0 +1,583 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Shared Infrastructure Stack for EC2-based ECS Deployment.
+  Mirrors main.yaml (Fargate) architecture for cost comparison.
+  Deploys VPC, security groups, IAM roles, ALB, API Gateway, EC2 ECS Cluster,
+  and monitoring. Per-project resources (ECR, pipelines, services) are
+  deployed separately via project-ec2.yaml.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+          - ComputeType
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+      - Label:
+          default: "EC2 Instance Configuration"
+        Parameters:
+          - InstanceType
+          - Ec2MinCapacity
+          - Ec2MaxCapacity
+          - Ec2DesiredCapacity
+          - RootVolumeSize
+      - Label:
+          default: "Nested Stack Configuration"
+        Parameters:
+          - TemplatesBucketName
+          - TemplatesBucketPrefix
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      ComputeType:
+        default: "Compute Type"
+      VpcCidr:
+        default: "VPC CIDR Block"
+      InstanceType:
+        default: "EC2 Instance Type"
+      Ec2MinCapacity:
+        default: "EC2 Minimum Capacity"
+      Ec2MaxCapacity:
+        default: "EC2 Maximum Capacity"
+      Ec2DesiredCapacity:
+        default: "EC2 Desired Capacity"
+      RootVolumeSize:
+        default: "Root Volume Size (GB)"
+      TemplatesBucketName:
+        default: "S3 Bucket for Nested Templates"
+      TemplatesBucketPrefix:
+        default: "S3 Prefix for Nested Templates"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Description: Deployment environment (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name used for resource naming (lowercase, alphanumeric, hyphens only)
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
+
+  # Compute Type Parameter
+  # Requirement 2.1: THE deployment scripts SHALL accept a compute-type parameter
+  ComputeType:
+    Type: String
+    Description: Compute type for this deployment (ec2 for EC2-based ECS)
+    Default: ec2
+    AllowedValues:
+      - ec2
+    ConstraintDescription: Must be ec2 for this template
+
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Description: CIDR block for the VPC
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.0.0/16)
+
+  # EC2 Instance Configuration
+  # Requirement 1.3: THE Launch_Template SHALL configure EC2 instances with
+  #                  appropriate instance types (t3.medium default, configurable)
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for ECS container instances
+    Default: t3.medium
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  # Requirement 1.6: THE Auto_Scaling_Group SHALL have minimum capacity of 1
+  #                  and maximum capacity of 10 (configurable)
+  Ec2MinCapacity:
+    Type: Number
+    Description: Minimum number of EC2 instances in the Auto Scaling Group
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  Ec2MaxCapacity:
+    Type: Number
+    Description: Maximum number of EC2 instances in the Auto Scaling Group
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  Ec2DesiredCapacity:
+    Type: Number
+    Description: Desired number of EC2 instances in the Auto Scaling Group
+    Default: 2
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  # Requirement 5.5: THE Launch_Template SHALL configure appropriate root volume
+  #                  size (30GB minimum)
+  RootVolumeSize:
+    Type: Number
+    Description: Size of the root EBS volume in GB
+    Default: 30
+    MinValue: 30
+    MaxValue: 500
+    ConstraintDescription: Must be between 30 and 500 GB
+
+  # Nested Stack Configuration
+  TemplatesBucketName:
+    Type: String
+    Description: S3 bucket name containing nested CloudFormation templates
+    MinLength: 3
+    MaxLength: 63
+
+  TemplatesBucketPrefix:
+    Type: String
+    Description: S3 prefix (folder path) for nested templates
+    Default: infrastructure
+    MaxLength: 256
+
+  CustomDomainName:
+    Type: String
+    Description: Custom domain name for the API Gateway (e.g., api.my-company.com.vn). Leave empty to skip.
+    Default: ""
+
+  CertificateArn:
+    Type: String
+    Description: ACM Certificate ARN for the custom domain. Required if CustomDomainName is set.
+    Default: ""
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+
+# =============================================================================
+# RESOURCES - NESTED STACKS
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # SHARED INFRASTRUCTURE STACKS
+  # These stacks are shared between Fargate and EC2 deployments
+  # Requirement 2.5: THE EC2 and Fargate deployments SHALL share the same VPC,
+  #                  ALB target groups, and ECR repository
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # VPC and Networking Stack (Shared)
+  # Requirement 1.5: THE ECS_EC2_Cluster SHALL be deployed in the same private
+  #                  subnets as the Fargate cluster
+  # ---------------------------------------------------------------------------
+  VpcStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/vpc.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcCidr: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc-stack
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # Security Groups Stack (Shared)
+  # ---------------------------------------------------------------------------
+  SecurityGroupsStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: VpcStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/security-groups.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt VpcStack.Outputs.VpcId
+        VpcCidr: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-security-groups-stack
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # IAM Roles and Policies Stack (Shared)
+  # Includes EC2 instance role and instance profile for EC2 deployment
+  # Requirement 1.7: THE Instance_Profile SHALL grant EC2 instances permissions
+  #                  to register with ECS and pull images from ECR
+  # ---------------------------------------------------------------------------
+  IamStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/iam.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-iam-stack
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # Application Load Balancer Stack (Shared)
+  # ---------------------------------------------------------------------------
+  AlbStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VpcStack
+      - SecurityGroupsStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/alb.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt VpcStack.Outputs.VpcId
+        PrivateSubnet1Id: !GetAtt VpcStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt VpcStack.Outputs.PrivateSubnet2Id
+        AlbSecurityGroupId: !GetAtt SecurityGroupsStack.Outputs.AlbSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-alb-stack
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # API Gateway Stack (Shared)
+  # Provides HTTP API Gateway, VPC Link, ALB integration, and Webhook Lambda
+  # Same as Fargate deployment for consistent API access
+  # ---------------------------------------------------------------------------
+  ApiGatewayStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VpcStack
+      - SecurityGroupsStack
+      - AlbStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/api-gateway.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt VpcStack.Outputs.VpcId
+        PrivateSubnet1Id: !GetAtt VpcStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt VpcStack.Outputs.PrivateSubnet2Id
+        VpcLinkSecurityGroupId: !GetAtt SecurityGroupsStack.Outputs.VpcLinkSecurityGroupId
+        AlbListenerArn: !GetAtt AlbStack.Outputs.HttpListenerArn
+        AlbDnsName: !GetAtt AlbStack.Outputs.AlbDnsName
+        CustomDomainName: !Ref CustomDomainName
+        CertificateArn: !Ref CertificateArn
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-api-gateway-stack
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # EC2-SPECIFIC STACKS
+  # These stacks are specific to the EC2 deployment
+  # Requirement 2.4: THE EC2 deployment SHALL use a distinct stack name suffix
+  #                  to avoid conflicts with Fargate deployment
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # ECS EC2 Cluster Stack
+  # Requirement 1.1: THE ECS_EC2_Cluster SHALL be created with EC2 launch type
+  #                  capacity providers
+  # Requirement 1.4: THE Capacity_Provider SHALL enable managed scaling with
+  #                  target capacity of 100%
+  # Requirement 8.1: THE EC2 cluster SHALL have Container Insights enabled
+  # ---------------------------------------------------------------------------
+  EcsEc2ClusterStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VpcStack
+      - SecurityGroupsStack
+      - IamStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/ecs-ec2-cluster.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        PrivateSubnet1Id: !GetAtt VpcStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt VpcStack.Outputs.PrivateSubnet2Id
+        EcsSecurityGroupId: !GetAtt SecurityGroupsStack.Outputs.EcsSecurityGroupId
+        InstanceType: !Ref InstanceType
+        MinCapacity: !Ref Ec2MinCapacity
+        MaxCapacity: !Ref Ec2MaxCapacity
+        DesiredCapacity: !Ref Ec2DesiredCapacity
+        RootVolumeSize: !Ref RootVolumeSize
+        Ec2InstanceProfileArn: !GetAtt IamStack.Outputs.Ec2InstanceProfileArn
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-ec2-cluster-stack
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        # Requirement 3.1: ComputeType tag for cost tracking
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # Monitoring and Observability Stack (Shared)
+  # Same as Fargate deployment — SNS, CloudWatch Dashboard, Alarms
+  # ---------------------------------------------------------------------------
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - EcsEc2ClusterStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/monitoring.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ClusterName: !GetAtt EcsEc2ClusterStack.Outputs.Ec2ClusterName
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-monitoring-stack
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ComputeType
+          Value: !Ref ComputeType
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # ---------------------------------------------------------------------------
+  # Environment Information
+  # ---------------------------------------------------------------------------
+  Environment:
+    Description: Deployment environment
+    Value: !Ref Environment
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-Environment
+
+  ProjectName:
+    Description: Project name
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-ProjectName
+
+  ComputeType:
+    Description: Compute type for this deployment (ec2)
+    Value: !Ref ComputeType
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-ComputeType
+
+  # ---------------------------------------------------------------------------
+  # VPC Outputs (Shared Infrastructure)
+  # ---------------------------------------------------------------------------
+  VpcId:
+    Description: VPC ID
+    Value: !GetAtt VpcStack.Outputs.VpcId
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-VpcId
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !GetAtt VpcStack.Outputs.PrivateSubnet1Id
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-PrivateSubnet1Id
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !GetAtt VpcStack.Outputs.PrivateSubnet2Id
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-PrivateSubnet2Id
+
+  # ---------------------------------------------------------------------------
+  # ALB Outputs (Shared Infrastructure)
+  # ---------------------------------------------------------------------------
+  AlbDnsName:
+    Description: Application Load Balancer DNS name
+    Value: !GetAtt AlbStack.Outputs.AlbDnsName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-AlbDnsName
+
+  AlbArn:
+    Description: Application Load Balancer ARN
+    Value: !GetAtt AlbStack.Outputs.AlbArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-AlbArn
+
+  TargetGroupArn:
+    Description: ALB Target Group ARN
+    Value: !GetAtt AlbStack.Outputs.TargetGroupArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-TargetGroupArn
+
+  # ---------------------------------------------------------------------------
+  # API Gateway Outputs
+  # ---------------------------------------------------------------------------
+  ApiGatewayEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !GetAtt ApiGatewayStack.Outputs.ApiGatewayEndpoint
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-ApiGatewayEndpoint
+
+  ApiGatewayId:
+    Description: API Gateway ID
+    Value: !GetAtt ApiGatewayStack.Outputs.ApiGatewayId
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-ApiGatewayId
+
+  # ---------------------------------------------------------------------------
+  # Monitoring Outputs
+  # ---------------------------------------------------------------------------
+  NotificationTopicArn:
+    Description: SNS Notification Topic ARN
+    Value: !GetAtt MonitoringStack.Outputs.NotificationTopicArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-NotificationTopicArn
+
+  DashboardName:
+    Description: CloudWatch Dashboard Name
+    Value: !GetAtt MonitoringStack.Outputs.DashboardName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-DashboardName
+
+  # ---------------------------------------------------------------------------
+  # ECS EC2 Cluster Outputs
+  # Key resource ARNs exported for external reference
+  # ---------------------------------------------------------------------------
+  Ec2ClusterArn:
+    Description: ECS EC2 Cluster ARN
+    Value: !GetAtt EcsEc2ClusterStack.Outputs.Ec2ClusterArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ClusterArn
+
+  Ec2ClusterName:
+    Description: ECS EC2 Cluster Name
+    Value: !GetAtt EcsEc2ClusterStack.Outputs.Ec2ClusterName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ClusterName
+
+  CapacityProviderName:
+    Description: ECS Capacity Provider Name
+    Value: !GetAtt EcsEc2ClusterStack.Outputs.CapacityProviderName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2CapacityProviderName
+
+  # ---------------------------------------------------------------------------
+  # Auto Scaling Group Outputs
+  # ---------------------------------------------------------------------------
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !GetAtt EcsEc2ClusterStack.Outputs.AutoScalingGroupName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2AsgName
+
+  AutoScalingGroupArn:
+    Description: Auto Scaling Group ARN
+    Value: !GetAtt EcsEc2ClusterStack.Outputs.AutoScalingGroupArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2AsgArn
+
+  # ---------------------------------------------------------------------------
+  # Launch Template Outputs
+  # ---------------------------------------------------------------------------
+  LaunchTemplateId:
+    Description: Launch Template ID
+    Value: !GetAtt EcsEc2ClusterStack.Outputs.LaunchTemplateId
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2LaunchTemplateId
+
+  # ---------------------------------------------------------------------------
+  # IAM Role Outputs
+  # ---------------------------------------------------------------------------
+  Ec2InstanceRoleArn:
+    Description: EC2 Instance Role ARN
+    Value: !GetAtt IamStack.Outputs.Ec2InstanceRoleArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-InstanceRoleArn
+
+  Ec2InstanceProfileArn:
+    Description: EC2 Instance Profile ARN
+    Value: !GetAtt IamStack.Outputs.Ec2InstanceProfileArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ec2-InstanceProfileArn
+
+  # ---------------------------------------------------------------------------
+  # Log Group Outputs
+  # ---------------------------------------------------------------------------
+  Ec2ClusterLogGroupName:
+    Description: CloudWatch Log Group Name for EC2 cluster logs
+    Value: !GetAtt EcsEc2ClusterStack.Outputs.EcsEc2LogGroupName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-Ec2ClusterLogGroupName
+
+  # ---------------------------------------------------------------------------
+  # Deployment Summary
+  # ---------------------------------------------------------------------------
+  Ec2DeploymentSummary:
+    Description: Summary of EC2 deployment configuration
+    Value: !Sub |
+      EC2 Deployment Summary:
+      - Compute Type: ${ComputeType}
+      - Environment: ${Environment}
+      - Instance Type: ${InstanceType}
+      - EC2 Capacity: ${Ec2MinCapacity}-${Ec2MaxCapacity} instances
+      - Per-project services deployed via project-ec2.yaml
