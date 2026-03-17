@@ -21,6 +21,13 @@ __pycache__/
 .claude/
 .codex/
 .gemini/
+!.gemini/skills/
+!.gemini/mcp/
 .kiro/
 .opencode/
 .windsurf/
+.beads/
+.dolt/
+.doltcfg/
+beads_cash-replatform/
+beads_cicd-poc/
