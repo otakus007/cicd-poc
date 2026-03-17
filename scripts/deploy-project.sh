@@ -180,10 +180,11 @@ echo "Priority:     ${PRIORITY}"
 echo "Region:       ${AWS_REGION}"
 echo "============================================"
 
-# Upload project template to S3
-echo "Uploading ${TEMPLATE_FILE} to S3..."
-aws s3 cp "${PROJECT_ROOT}/infrastructure/${TEMPLATE_FILE}" \
-    "s3://${TEMPLATES_BUCKET}/${TEMPLATES_PREFIX}/${TEMPLATE_FILE}" \
+# Upload project templates to S3
+echo "Uploading templates to S3..."
+aws s3 sync "${PROJECT_ROOT}/infrastructure/" \
+    "s3://${TEMPLATES_BUCKET}/${TEMPLATES_PREFIX}/" \
+    --exclude "*" --include "*.yaml" \
     --region "$AWS_REGION"
 
 # Also upload buildspecs
