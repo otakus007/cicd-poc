@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Oracle RDS Instance for Japfa API Platform.
+  Deploys a single-node Oracle Standard Edition 2 instance in private subnets.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: japfa-api
+  DBInstanceClass:
+    Type: String
+    Description: Database instance type
+    Default: db.t3.medium
+    AllowedValues: [db.t3.medium, db.t3.large, db.m5.large, db.m5.xlarge]
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+  DBName:
+    Type: String
+    Description: Oracle SID (System ID)
+    Default: ORCL
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+  MasterUsername:
+    Type: String
+    Default: admin
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+    Description: Password for the master user
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # DB Subnet Group
+  # ---------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub Subnet group for ${ProjectName} Oracle RDS
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-rds-subnet-group
+
+  # ---------------------------------------------------------------------------
+  # RDS Oracle Instance
+  # ---------------------------------------------------------------------------
+  OracleDBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-${Environment}-db
+      Engine: oracle-se2
+      EngineVersion: "19"
+      LicenseModel: license-included
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      DBName: !Ref DBName
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroupId
+      MultiAZ: !If [IsProduction, true, false]
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: !If [IsProduction, 7, 1]
+      PreferredBackupWindow: "17:00-18:00" # UTC
+      PreferredMaintenanceWindow: "sun:19:00-sun:20:00" # UTC
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-oracle
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+
+Outputs:
+  DBEndpoint:
+    Description: Endpoint for the Oracle RDS instance
+    Value: !GetAtt OracleDBInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RdsEndpoint
+  DBPort:
+    Description: Port for the Oracle RDS instance
+    Value: !GetAtt OracleDBInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RdsPort
+  DBSid:
+    Description: Oracle SID
+    Value: !Ref DBName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RdsSid

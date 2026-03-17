@@ -198,10 +198,92 @@ Resources:
         - Key: Purpose
           Value: CodeBuild Projects
 
+  # ---------------------------------------------------------------------------
+  # Legacy App Security Group (Windows EC2)
+  # Purpose: Controls traffic to the single Windows server
+  # Ingress: HTTP (80) from ALB SG only
+  # Egress: HTTPS (443) to 0.0.0.0/0, Oracle (1521) to RDS SG
+  # ---------------------------------------------------------------------------
+  LegacyAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-legacy-sg
+      GroupDescription: Security group for legacy Windows IIS server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS APIs
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          CidrIp: !Ref VpcCidr
+          Description: Oracle access within VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-legacy-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # RDS Oracle Security Group
+  # Purpose: Controls traffic to the shared Oracle Database
+  # Ingress: Oracle (1521) from ECS tasks SG and Legacy App SG
+  # ---------------------------------------------------------------------------
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-rds-sg
+      GroupDescription: Security group for Oracle RDS - allows 1521 from app layers
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          SourceSecurityGroupId: !Ref EcsSecurityGroup
+          Description: Oracle access from ECS Fargate tasks
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          SourceSecurityGroupId: !Ref LegacyAppSecurityGroup
+          Description: Oracle access from legacy Windows server
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-rds-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Shared Oracle Database
+
 # =============================================================================
 # OUTPUTS
 # =============================================================================
 Outputs:
+  LegacyAppSecurityGroupId:
+    Description: Legacy App Security Group ID
+    Value: !Ref LegacyAppSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LegacyAppSecurityGroupId
+
+  # ... (giữ nguyên các outputs cũ)
+  RdsSecurityGroupId:
+    Description: RDS Oracle Security Group ID
+    Value: !Ref RdsSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RdsSecurityGroupId
+
   # VPC Link Security Group Outputs
   VpcLinkSecurityGroupId:
     Description: VPC Link Security Group ID

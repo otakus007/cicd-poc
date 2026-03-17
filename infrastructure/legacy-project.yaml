@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Root Stack for Legacy Project (Lift-and-Shift Phase).
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: japfa-api
+  TemplatesBucketName:
+    Type: String
+  TemplatesBucketPrefix:
+    Type: String
+    Default: infrastructure
+  InstanceType:
+    Type: String
+    Default: t3.medium
+
+Resources:
+  # 1. Windows Server Instance
+  LegacyServerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/legacy-windows-ec2.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId:
+          Fn::ImportValue: !Sub ${ProjectName}-${Environment}-VpcId
+        PrivateSubnetId:
+          Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet1Id
+        LegacyAppSecurityGroupId:
+          Fn::ImportValue: !Sub ${ProjectName}-${Environment}-LegacyAppSecurityGroupId
+        InstanceType: !Ref InstanceType
+
+  # 2. ALB Integration
+  LegacyAlbStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: LegacyServerStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/legacy-alb-integration.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId:
+          Fn::ImportValue: !Sub ${ProjectName}-${Environment}-VpcId
+        HttpListenerArn:
+          Fn::ImportValue: !Sub ${ProjectName}-${Environment}-HttpListenerArn
+        LegacyInstanceId: !GetAtt LegacyServerStack.Outputs.InstanceId
+        PathPattern: "/api/*"
+        Priority: 10 # High priority for legacy catch-all
+
+Outputs:
+  LegacyInstanceId:
+    Value: !GetAtt LegacyServerStack.Outputs.InstanceId
+  LegacyPrivateIp:
+    Value: !GetAtt LegacyServerStack.Outputs.PrivateIp

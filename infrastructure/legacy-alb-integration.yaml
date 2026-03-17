@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ALB Integration for Legacy Windows Server (Nested Stack).
+
+Parameters:
+  Environment:
+    Type: String
+  ProjectName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  HttpListenerArn:
+    Type: String
+  LegacyInstanceId:
+    Type: String
+  PathPattern:
+    Type: String
+    Default: /api/*
+  Priority:
+    Type: Number
+    Default: 10
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Target Group for Legacy Server
+  # ---------------------------------------------------------------------------
+  LegacyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-legacy-tg
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref LegacyInstanceId
+          Port: 80
+      HealthCheckPath: /health.html
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckIntervalSeconds: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-legacy-tg
+
+  # ---------------------------------------------------------------------------
+  # Listener Rule
+  # ---------------------------------------------------------------------------
+  LegacyListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListenerArn
+      Priority: !Ref Priority
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - !Ref PathPattern
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref LegacyTargetGroup

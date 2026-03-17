@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Legacy Windows Server IIS Instance for Japfa API Platform.
+  Deploys a single Windows Server instance in a private subnet with IIS and .NET Framework.
+
+Parameters:
+  Environment:
+    Type: String
+  ProjectName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  LegacyAppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  # Use latest Windows Server 2022 Base
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # IAM Role for Legacy Windows Server
+  # ---------------------------------------------------------------------------
+  LegacyInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-legacy-role
+
+  LegacyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref LegacyInstanceRole
+
+  # ---------------------------------------------------------------------------
+  # Windows EC2 Instance
+  # ---------------------------------------------------------------------------
+  LegacyWindowsInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref ImageId
+      SubnetId: !Ref PrivateSubnetId
+      SecurityGroupIds:
+        - !Ref LegacyAppSecurityGroupId
+      IamInstanceProfile: !Ref LegacyInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          # Install IIS and ASP.NET 4.5/4.8
+          Install-WindowsFeature -name Web-Server, Web-Mgmt-Console, Web-Asp-Net45, Web-Net-Ext45, Web-ISAPI-Ext, Web-ISAPI-Filter
+          
+          # Ensure World Wide Web Publishing Service is running and set to automatic
+          Set-Service -Name W3SVC -StartupType Automatic
+          Start-Service -Name W3SVC
+          
+          # Create a basic health check file
+          New-Item -Path "C:\inetpub\wwwroot\health.html" -ItemType File -Value "OK"
+          
+          # Open port 80 in Windows Firewall
+          New-NetFirewallRule -DisplayName "Allow HTTP" -Direction Inbound -LocalPort 80 -Protocol TCP -Action Allow
+          
+          # Note: Connection strings and actual API code should be deployed via CI/CD or automation tools
+          </powershell>
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-legacy-server
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Role
+          Value: Legacy-IIS
+
+Outputs:
+  InstanceId:
+    Value: !Ref LegacyWindowsInstance
+  PrivateIp:
+    Value: !GetAtt LegacyWindowsInstance.PrivateIp
