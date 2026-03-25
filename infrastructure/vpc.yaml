@@ -58,9 +58,64 @@ Parameters:
     ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.0.0/16)
 
 # =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+  # Requirement 3.1: Single NAT Gateway for dev to reduce costs
+  UseHighAvailability: !Or
+    - !Condition IsProduction
+    - !Condition IsStaging
+
+# =============================================================================
 # RESOURCES
 # =============================================================================
 Resources:
+  # ---------------------------------------------------------------------------
+  # VPC Flow Logs
+  # Requirement 1.3: Enable VPC Flow Logs for auditing
+  # ---------------------------------------------------------------------------
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VpcFlowLogRole.Arn
+
+  VpcFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /vpc/${ProjectName}-${Environment}/flow-logs
+      RetentionInDays: !If [IsProduction, 90, 14]
+
+  VpcFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: VpcFlowLogPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt VpcFlowLogGroup.Arn
+
   # ---------------------------------------------------------------------------
   # VPC
   # ---------------------------------------------------------------------------
@@ -191,6 +246,7 @@ Resources:
 
   NatEip2:
     Type: AWS::EC2::EIP
+    Condition: UseHighAvailability
     DependsOn: InternetGatewayAttachment
     Properties:
       Domain: vpc
@@ -220,6 +276,7 @@ Resources:
 
   NatGateway2:
     Type: AWS::EC2::NatGateway
+    Condition: UseHighAvailability
     Properties:
       AllocationId: !GetAtt NatEip2.AllocationId
       SubnetId: !Ref PublicSubnet2
@@ -300,6 +357,7 @@ Resources:
 
   PrivateRouteTable2:
     Type: AWS::EC2::RouteTable
+    Condition: UseHighAvailability
     Properties:
       VpcId: !Ref VPC
       Tags:
@@ -314,6 +372,7 @@ Resources:
 
   PrivateRoute2:
     Type: AWS::EC2::Route
+    Condition: UseHighAvailability
     Properties:
       RouteTableId: !Ref PrivateRouteTable2
       DestinationCidrBlock: 0.0.0.0/0
@@ -323,7 +382,123 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet2
-      RouteTableId: !Ref PrivateRouteTable2
+      RouteTableId: !If [UseHighAvailability, !Ref PrivateRouteTable2, !Ref PrivateRouteTable1]
+
+  # ---------------------------------------------------------------------------
+  # VPC Endpoint Security Group
+  # Requirement 5.3: Security group for Interface VPC Endpoints
+  # Allows HTTPS (443) inbound from VPC CIDR for ECR/Logs endpoint access
+  # ---------------------------------------------------------------------------
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC Interface Endpoints - allows HTTPS from VPC CIDR
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: Allow HTTPS from VPC CIDR for VPC Endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpce-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # VPC Endpoints
+  # Requirement 5: VPC Endpoints for S3 and ECR to reduce NAT Gateway costs
+  # ---------------------------------------------------------------------------
+
+  # Gateway VPC Endpoint for S3
+  # Requirement 5.1: Associated with all private route tables
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: !If
+        - UseHighAvailability
+        - - !Ref PrivateRouteTable1
+          - !Ref PrivateRouteTable2
+        - - !Ref PrivateRouteTable1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-s3-vpce
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Interface VPC Endpoint for ECR API
+  # Requirement 5.2: Interface endpoint for ecr.api service
+  EcrApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecr-api-vpce
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Interface VPC Endpoint for ECR Docker
+  # Requirement 5.2: Interface endpoint for ecr.dkr service
+  EcrDkrVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecr-dkr-vpce
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Interface VPC Endpoint for CloudWatch Logs
+  # Requirement 5.2: Interface endpoint for logs service
+  LogsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-logs-vpce
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
 
 # =============================================================================
 # OUTPUTS
@@ -432,6 +607,7 @@ Outputs:
 
   NatGateway2Id:
     Description: NAT Gateway 2 ID (AZ-b)
+    Condition: UseHighAvailability
     Value: !Ref NatGateway2
     Export:
       Name: !Sub ${ProjectName}-${Environment}-NatGateway2Id
@@ -444,6 +620,7 @@ Outputs:
 
   NatEip2:
     Description: NAT Gateway 2 Elastic IP
+    Condition: UseHighAvailability
     Value: !Ref NatEip2
     Export:
       Name: !Sub ${ProjectName}-${Environment}-NatEip2
@@ -463,7 +640,21 @@ Outputs:
 
   PrivateRouteTable2Id:
     Description: Private Route Table 2 ID (AZ-b)
+    Condition: UseHighAvailability
     Value: !Ref PrivateRouteTable2
     Export:
       Name: !Sub ${ProjectName}-${Environment}-PrivateRouteTable2Id
+
+  # VPC Endpoint Outputs
+  S3VpcEndpointId:
+    Description: S3 Gateway VPC Endpoint ID
+    Value: !Ref S3VpcEndpoint
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-S3VpcEndpointId
+
+  VpcEndpointSecurityGroupId:
+    Description: VPC Endpoint Security Group ID
+    Value: !Ref VpcEndpointSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-VpcEndpointSecurityGroupId
 

@@ -4,16 +4,29 @@ Description: Task Definition for Per-Project Stack (Nested Stack).
 Parameters:
   Environment:
     Type: String
+    AllowedValues: [dev, staging, prod]
   ProjectName:
     Type: String
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
   ServiceName:
     Type: String
-  ContainerCpu:
+  TaskCpu:
     Type: String
-  ContainerMemory:
+    Default: "auto"
+    AllowedValues: ["auto", "256", "512", "1024", "2048", "4096"]
+    Description: CPU units for the task. Use "auto" to use environment-based defaults from Mappings.
+  TaskMemory:
     Type: String
+    Default: "auto"
+    AllowedValues: ["auto", "512", "1024", "2048", "3072", "4096", "5120", "6144", "7168", "8192"]
+    Description: Memory (MB) for the task. Use "auto" to use environment-based defaults from Mappings.
   ContainerPort:
     Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
   ExecutionRoleArn:
     Type: String
   TaskRoleArn:
@@ -22,35 +35,118 @@ Parameters:
     Type: String
   ContainerImage:
     Type: String
+    Default: "public.ecr.aws/nginx/nginx:alpine"
+    Description: ECR image URI for the container
+  HealthCheckPath:
+    Type: String
+    Default: /health
+    AllowedPattern: ^/.*
+  HealthCheckInterval:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 300
+  HealthCheckTimeout:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 60
+  HealthCheckRetries:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+  HealthCheckStartPeriod:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 300
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+Mappings:
+  EnvironmentTaskSizing:
+    dev:
+      Cpu: "256"
+      Memory: "512"
+    staging:
+      Cpu: "512"
+      Memory: "1024"
+    prod:
+      Cpu: "1024"
+      Memory: "2048"
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+  UseMappedCpu: !Equals [!Ref TaskCpu, "auto"]
+  UseMappedMemory: !Equals [!Ref TaskMemory, "auto"]
 
 Resources:
-  ServiceLogGroup:
+  TaskLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /ecs/${ProjectName}-${Environment}-${ServiceName}
-      RetentionInDays: 30
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-${ServiceName}-logs
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ComputeType
+          Value: fargate
 
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    DependsOn: TaskLogGroup
     Properties:
       Family: !Sub ${ProjectName}-${Environment}-${ServiceName}
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
-      Cpu: !Ref ContainerCpu
-      Memory: !Ref ContainerMemory
-      ExecutionRoleArn: !Ref ExecutionRoleArn
-      TaskRoleArn: !Ref TaskRoleArn
+      Cpu: !If
+        - UseMappedCpu
+        - !FindInMap [EnvironmentTaskSizing, !Ref Environment, Cpu]
+        - !Ref TaskCpu
+      Memory: !If
+        - UseMappedMemory
+        - !FindInMap [EnvironmentTaskSizing, !Ref Environment, Memory]
+        - !Ref TaskMemory
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-execution-role"
+      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-ecs-task-role"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
       ContainerDefinitions:
-        - Name: !Sub ${ServiceName}-container
+        - Name: !Sub ${ProjectName}-${Environment}-container
           Image: !Ref ContainerImage
           Essential: true
+          Privileged: false
+          LinuxParameters:
+            InitProcessEnabled: true
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65536
+              HardLimit: 65536
           PortMappings:
             - ContainerPort: !Ref ContainerPort
               Protocol: tcp
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub curl -f http://localhost:${ContainerPort}${HealthCheckPath} || exit 1
+            Interval: !Ref HealthCheckInterval
+            Timeout: !Ref HealthCheckTimeout
+            Retries: !Ref HealthCheckRetries
+            StartPeriod: !Ref HealthCheckStartPeriod
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: !Ref ServiceLogGroup
+              awslogs-group: !Ref TaskLogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: ecs
           Environment:
@@ -60,12 +156,67 @@ Resources:
               Value: !Ref ServiceName
             - Name: PATH_BASE
               Value: !Ref PathBase
+            - Name: ASPNETCORE_URLS
+              Value: !Sub "http://+:${ContainerPort}"
+            - Name: DOTNET_CLI_TELEMETRY_OPTOUT
+              Value: "1"
+          Secrets:
+            - Name: ConnectionStrings__PoultrySale
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/${ServiceName}/db/connection-strings:PoultrySale::"
+            - Name: ConnectionStrings__MasterDb
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/${ServiceName}/db/connection-strings:MasterDb::"
       Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-${ServiceName}
         - Key: Environment
           Value: !Ref Environment
-        - Key: Service
-          Value: !Ref ServiceName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ComputeType
+          Value: fargate
 
 Outputs:
   TaskDefinitionArn:
     Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-${ServiceName}-TaskDefArn
+
+  TaskDefinitionFamily:
+    Value: !Sub ${ProjectName}-${Environment}-${ServiceName}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-${ServiceName}-TaskDefFamily
+
+  ContainerName:
+    Value: !Sub ${ProjectName}-${Environment}-container
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-${ServiceName}-ContainerName
+
+  ContainerPort:
+    Value: !Ref ContainerPort
+
+  TaskCpu:
+    Value: !If
+      - UseMappedCpu
+      - !FindInMap [EnvironmentTaskSizing, !Ref Environment, Cpu]
+      - !Ref TaskCpu
+
+  TaskMemory:
+    Value: !If
+      - UseMappedMemory
+      - !FindInMap [EnvironmentTaskSizing, !Ref Environment, Memory]
+      - !Ref TaskMemory
+
+  HealthCheckPath:
+    Value: !Ref HealthCheckPath
+
+  TaskLogGroupArn:
+    Value: !GetAtt TaskLogGroup.Arn
+
+  TaskLogGroupName:
+    Value: !Ref TaskLogGroup
+
+  ExecutionRoleArn:
+    Value: !Ref ExecutionRoleArn
+
+  TaskRoleArn:
+    Value: !Ref TaskRoleArn
