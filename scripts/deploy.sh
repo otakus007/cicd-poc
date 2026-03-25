@@ -27,6 +27,7 @@ DEFAULT_COMPUTE_TYPE="fargate"
 # SOURCE LIBRARY MODULES
 # =============================================================================
 source "${SCRIPT_DIR}/lib/common.sh"
+source "${SCRIPT_DIR}/lib/deploy-utils.sh"
 source "${SCRIPT_DIR}/lib/cleanup.sh"
 source "${SCRIPT_DIR}/lib/templates.sh"
 source "${SCRIPT_DIR}/lib/stack-operations.sh"
@@ -56,6 +57,7 @@ Optional Options:
     --region                AWS region (default: uses AWS_DEFAULT_REGION or us-east-1)
     --profile               AWS CLI profile to use
     --rollback-on-failure   Enable automatic rollback on failure (default: true)
+    --override-policy       Temporarily override the stack policy during update (prod only)
     --skip-upload           Skip uploading templates to S3 (use existing)
     --dry-run               Validate templates without deploying
     -h, --help              Show this help message
@@ -93,6 +95,7 @@ TEMPLATES_PREFIX="infrastructure"
 AWS_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 AWS_PROFILE=""
 ROLLBACK_ON_FAILURE="true"
+OVERRIDE_POLICY="false"
 SKIP_UPLOAD="false"
 DRY_RUN="false"
 
@@ -141,6 +144,10 @@ while [[ $# -gt 0 ]]; do
         --rollback-on-failure)
             ROLLBACK_ON_FAILURE="$2"
             shift 2
+            ;;
+        --override-policy)
+            OVERRIDE_POLICY="true"
+            shift
             ;;
         --skip-upload)
             SKIP_UPLOAD="true"
@@ -215,6 +222,11 @@ validate_inputs() {
 cleanup_on_error() {
     local exit_code=$?
 
+    # Always release the deployment lock on exit (success or failure)
+    if [[ -n "${TEMPLATES_BUCKET:-}" && -n "${PROJECT_NAME:-}" && -n "${ENVIRONMENT:-}" ]]; then
+        release_lock "$TEMPLATES_BUCKET" "$PROJECT_NAME" "$ENVIRONMENT"
+    fi
+
     if [[ $exit_code -ne 0 ]]; then
         print_error "Deployment failed with exit code: $exit_code"
 
@@ -259,6 +271,29 @@ main() {
 
     # Upload phase
     upload_templates
+
+    # Validate S3 template upload before stack operations
+    validate_s3_uploads
+
+    # Dry-run: display cost estimate and exit
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local template_file="main.yaml"
+        if [[ "$COMPUTE_TYPE" == "ec2" ]]; then
+            template_file="main-ec2.yaml"
+        fi
+        local template_url="https://${TEMPLATES_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${TEMPLATES_PREFIX}/${template_file}"
+        display_cost_estimate "$template_url"
+        print_info "Dry run complete — no resources were created or updated."
+        return 0
+    fi
+
+    # Acquire deployment lock (released by EXIT trap)
+    local stack_name
+    stack_name=$(get_stack_name)
+    if ! acquire_lock "$TEMPLATES_BUCKET" "$PROJECT_NAME" "$ENVIRONMENT" "$stack_name"; then
+        print_error "Could not acquire deployment lock. Another deployment may be in progress."
+        exit 1
+    fi
 
     # Deployment phase
     deploy_stack

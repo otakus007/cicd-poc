@@ -103,10 +103,44 @@ upload_templates() {
         local s3_key="${TEMPLATES_PREFIX}/${template}"
 
         print_info "Uploading: $template -> s3://${TEMPLATES_BUCKET}/${s3_key}"
-        aws s3 cp "$template_path" "s3://${TEMPLATES_BUCKET}/${s3_key}" $AWS_CLI_OPTS
+        retry_with_backoff aws s3 cp "$template_path" "s3://${TEMPLATES_BUCKET}/${s3_key}" $AWS_CLI_OPTS
     done
 
     print_success "All templates uploaded to S3"
+}
+
+# =============================================================================
+# VALIDATE S3 UPLOADS
+# =============================================================================
+
+validate_s3_uploads() {
+    if [[ "$SKIP_UPLOAD" == "true" ]]; then
+        return 0
+    fi
+
+    print_header "Validating S3 Template Uploads"
+
+    local templates
+    read -ra templates <<< "$(get_template_list)"
+
+    local errors=0
+
+    for template in "${templates[@]}"; do
+        local s3_key="${TEMPLATES_PREFIX}/${template}"
+        if retry_with_backoff aws s3api head-object --bucket "$TEMPLATES_BUCKET" --key "$s3_key" $AWS_CLI_OPTS > /dev/null 2>&1; then
+            print_success "Verified: s3://${TEMPLATES_BUCKET}/${s3_key}"
+        else
+            print_error "Missing: s3://${TEMPLATES_BUCKET}/${s3_key}"
+            errors=$((errors + 1))
+        fi
+    done
+
+    if [[ $errors -gt 0 ]]; then
+        print_error "S3 upload validation failed — $errors template(s) not found in S3"
+        exit 1
+    fi
+
+    print_success "All templates verified in S3"
 }
 
 # =============================================================================

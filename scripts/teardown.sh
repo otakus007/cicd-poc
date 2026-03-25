@@ -27,6 +27,7 @@ DEFAULT_COMPUTE_TYPE="fargate"
 source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/cleanup.sh"
 source "${SCRIPT_DIR}/lib/ecs-operations.sh"
+source "${SCRIPT_DIR}/lib/deploy-utils.sh"
 
 # =============================================================================
 # USAGE
@@ -48,6 +49,7 @@ Optional Options:
     --region                AWS region (default: uses AWS_DEFAULT_REGION or us-east-1)
     --profile               AWS CLI profile to use
     --force                 Skip confirmation prompts (use with caution!)
+    --dry-run               Preview resources that would be deleted without performing deletions
     --delete-bucket         Also delete the S3 templates bucket
     --retain-logs           Retain CloudWatch log groups
     -h, --help              Show this help message
@@ -61,6 +63,9 @@ Examples:
 
     # Teardown production with force (no confirmation)
     $(basename "$0") -e prod --force
+
+    # Preview what would be deleted (dry-run)
+    $(basename "$0") -e dev --dry-run
 
     # Teardown and also delete the S3 templates bucket
     $(basename "$0") -e dev -b my-cfn-bucket --delete-bucket
@@ -82,6 +87,7 @@ AWS_PROFILE=""
 FORCE_DELETE="false"
 DELETE_BUCKET="false"
 RETAIN_LOGS="false"
+DRY_RUN="false"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -111,6 +117,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --force)
             FORCE_DELETE="true"
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN="true"
             shift
             ;;
         --delete-bucket)
@@ -225,6 +235,92 @@ confirm_deletion() {
 }
 
 # =============================================================================
+# DRY-RUN REPORT
+# =============================================================================
+
+dry_run_report() {
+    local stack_name=$(get_stack_name)
+
+    print_header "Dry-Run: Resources That Would Be Deleted"
+
+    echo "  Stack Name:     $stack_name"
+    echo "  Environment:    $ENVIRONMENT"
+    echo "  Project:        $PROJECT_NAME"
+    echo "  Compute Type:   $COMPUTE_TYPE"
+    echo "  Region:         $AWS_REGION"
+    echo ""
+
+    # Check if the stack exists
+    if ! check_stack_exists "$stack_name"; then
+        print_warning "Stack '$stack_name' does not exist. Nothing to tear down."
+        return 0
+    fi
+
+    # List all resources in the stack (including nested stacks)
+    local resources
+    resources=$(aws cloudformation list-stack-resources --stack-name "$stack_name" $AWS_CLI_OPTS \
+        --query 'StackResourceSummaries[*].[ResourceType,LogicalResourceId,PhysicalResourceId,ResourceStatus]' \
+        --output json 2>/dev/null)
+
+    if [[ -z "$resources" || "$resources" == "[]" || "$resources" == "null" ]]; then
+        print_warning "No resources found in stack."
+        return 0
+    fi
+
+    # Count resources by type
+    local -A type_counts
+    local total_resources=0
+    local resource_types
+
+    resource_types=$(printf '%s' "$resources" | grep -o '"AWS::[^"]*"' | tr -d '"' | sort)
+
+    while IFS= read -r rtype; do
+        [[ -z "$rtype" ]] && continue
+        type_counts["$rtype"]=$(( ${type_counts["$rtype"]:-0} + 1 ))
+        total_resources=$((total_resources + 1))
+    done <<< "$resource_types"
+
+    # Display resource table with cost estimates
+    local total_cost=0
+
+    echo "  Resources in Stack"
+    echo "  ============================================================"
+    printf "  %-50s %5s %10s\n" "Resource Type" "Count" "Est. Cost"
+    echo "  ------------------------------------------------------------"
+
+    local sorted_types
+    sorted_types=$(printf '%s\n' "${!type_counts[@]}" | sort)
+
+    while IFS= read -r rtype; do
+        [[ -z "$rtype" ]] && continue
+        local count="${type_counts[$rtype]}"
+        local unit_cost
+        unit_cost=$(get_resource_cost "$rtype")
+        local line_cost=$(( unit_cost * count ))
+        total_cost=$(( total_cost + line_cost ))
+
+        if [[ "$unit_cost" -eq 0 ]] && [[ -z "${_COST_MAP[$rtype]+_}" ]]; then
+            printf "  %-50s %5d %9s*\n" "$rtype" "$count" "\$${line_cost}"
+        else
+            printf "  %-50s %5d %10s\n" "$rtype" "$count" "\$${line_cost}"
+        fi
+    done <<< "$sorted_types"
+
+    echo "  ------------------------------------------------------------"
+    printf "  %-50s %5d %10s\n" "TOTAL" "$total_resources" "\$${total_cost}/mo"
+    echo "  ============================================================"
+    echo ""
+    echo "  * Cost not in mapping — shown as \$0. Actual cost may vary."
+    echo "  Note: Estimates are approximate monthly savings from teardown."
+    echo ""
+
+    print_info "Estimated monthly cost savings: \$${total_cost}/mo"
+    echo ""
+    print_info "This is a dry run. No resources were deleted."
+    print_info "Remove --dry-run to perform the actual teardown."
+}
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 
@@ -240,6 +336,12 @@ main() {
     # Validation
     validate_inputs
     validate_aws_credentials
+
+    # Dry-run mode: list resources and exit without deleting
+    if [[ "$DRY_RUN" == "true" ]]; then
+        dry_run_report
+        exit 0
+    fi
 
     # Check for shared resources with other compute type
     check_shared_resources

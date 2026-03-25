@@ -20,6 +20,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# Source shared deploy utilities (retry, locking, cost estimation)
+source "${SCRIPT_DIR}/lib/deploy-utils.sh"
+
 # Defaults
 INFRA_PROJECT_NAME="japfa-api"
 ENVIRONMENT="dev"
@@ -125,6 +128,14 @@ if [[ ! "$COMPUTE_TYPE" =~ ^(fargate|ec2)$ ]]; then
     exit 1
 fi
 
+# Release deployment lock on exit (success or failure)
+cleanup_on_exit() {
+    if [[ -n "${TEMPLATES_BUCKET:-}" && -n "${INFRA_PROJECT_NAME:-}" && -n "${ENVIRONMENT:-}" && -n "${SERVICE_NAME:-}" ]]; then
+        release_lock "$TEMPLATES_BUCKET" "${INFRA_PROJECT_NAME}-${SERVICE_NAME}" "$ENVIRONMENT"
+    fi
+}
+trap cleanup_on_exit EXIT
+
 # Validate shared infrastructure exists
 echo "Validating shared infrastructure..."
 if [[ "$COMPUTE_TYPE" == "ec2" ]]; then
@@ -132,7 +143,7 @@ if [[ "$COMPUTE_TYPE" == "ec2" ]]; then
 else
     SHARED_STACK_NAME="${INFRA_PROJECT_NAME}-${ENVIRONMENT}-main"
 fi
-SHARED_STACK_STATUS=$(aws cloudformation describe-stacks \
+SHARED_STACK_STATUS=$(retry_with_backoff aws cloudformation describe-stacks \
     --stack-name "$SHARED_STACK_NAME" \
     --region "$AWS_REGION" \
     --query 'Stacks[0].StackStatus' \
@@ -180,9 +191,15 @@ echo "Priority:     ${PRIORITY}"
 echo "Region:       ${AWS_REGION}"
 echo "============================================"
 
+# Acquire deployment lock (released by EXIT trap)
+if ! acquire_lock "$TEMPLATES_BUCKET" "${INFRA_PROJECT_NAME}-${SERVICE_NAME}" "$ENVIRONMENT" "$STACK_NAME"; then
+    echo "ERROR: Could not acquire deployment lock. Another deployment may be in progress."
+    exit 1
+fi
+
 # Upload project templates to S3
 echo "Uploading templates to S3..."
-aws s3 sync "${PROJECT_ROOT}/infrastructure/" \
+retry_with_backoff aws s3 sync "${PROJECT_ROOT}/infrastructure/" \
     "s3://${TEMPLATES_BUCKET}/${TEMPLATES_PREFIX}/" \
     --exclude "*" --include "*.yaml" \
     --region "$AWS_REGION"
@@ -190,13 +207,13 @@ aws s3 sync "${PROJECT_ROOT}/infrastructure/" \
 # Also upload buildspecs
 if [[ -d "${PROJECT_ROOT}/buildspecs" ]]; then
     echo "Uploading buildspecs to S3..."
-    aws s3 sync "${PROJECT_ROOT}/buildspecs/" \
+    retry_with_backoff aws s3 sync "${PROJECT_ROOT}/buildspecs/" \
         "s3://${TEMPLATES_BUCKET}/${TEMPLATES_PREFIX}/buildspecs/" \
         --region "$AWS_REGION"
 fi
 
 # Check if stack exists
-STACK_STATUS=$(aws cloudformation describe-stacks \
+STACK_STATUS=$(retry_with_backoff aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --region "$AWS_REGION" \
     --query 'Stacks[0].StackStatus' \
@@ -225,7 +242,7 @@ PARAMETERS=(
 
 if [[ "$STACK_STATUS" == "DOES_NOT_EXIST" ]]; then
     echo "Creating new stack..."
-    aws cloudformation create-stack \
+    retry_with_backoff aws cloudformation create-stack \
         --stack-name "$STACK_NAME" \
         --template-url "$TEMPLATE_URL" \
         --parameters "${PARAMETERS[@]}" \
@@ -234,13 +251,13 @@ if [[ "$STACK_STATUS" == "DOES_NOT_EXIST" ]]; then
         --tags "Key=Environment,Value=${ENVIRONMENT}" "Key=Service,Value=${SERVICE_NAME}" "Key=ComputeType,Value=${COMPUTE_TYPE}"
 
     echo "Waiting for stack creation..."
-    aws cloudformation wait stack-create-complete \
+    retry_with_backoff aws cloudformation wait stack-create-complete \
         --stack-name "$STACK_NAME" \
         --region "$AWS_REGION"
 else
     echo "Updating existing stack (status: ${STACK_STATUS})..."
     update_output=""
-    update_output=$(aws cloudformation update-stack \
+    update_output=$(retry_with_backoff aws cloudformation update-stack \
         --stack-name "$STACK_NAME" \
         --template-url "$TEMPLATE_URL" \
         --parameters "${PARAMETERS[@]}" \
@@ -256,7 +273,7 @@ else
 
     if [[ "$update_output" != *"No updates"* ]]; then
         echo "Waiting for stack update..."
-        aws cloudformation wait stack-update-complete \
+        retry_with_backoff aws cloudformation wait stack-update-complete \
             --stack-name "$STACK_NAME" \
             --region "$AWS_REGION"
     fi
@@ -274,7 +291,7 @@ if [[ -n "$AZURE_DEVOPS_PAT" ]]; then
     tmp_secret=$(mktemp)
     chmod 600 "$tmp_secret"
     printf '{"pat":"%s"}' "$AZURE_DEVOPS_PAT" > "$tmp_secret"
-    aws secretsmanager put-secret-value \
+    retry_with_backoff aws secretsmanager put-secret-value \
         --secret-id "${INFRA_PROJECT_NAME}/${ENVIRONMENT}/${SERVICE_NAME}/azure-devops-pat" \
         --secret-string "file://${tmp_secret}" \
         --region "$AWS_REGION"
@@ -289,7 +306,7 @@ fi
 echo ""
 echo "Seeding pipeline trigger..."
 # Get artifact bucket name from stack outputs (reliable) instead of reconstructing it
-ARTIFACT_BUCKET=$(aws cloudformation describe-stacks \
+ARTIFACT_BUCKET=$(retry_with_backoff aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --region "$AWS_REGION" \
     --query 'Stacks[0].Outputs[?OutputKey==`ArtifactBucketName`].OutputValue' \
@@ -298,7 +315,7 @@ ARTIFACT_BUCKET=$(aws cloudformation describe-stacks \
 # Fallback to convention-based name if stack output not available
 if [[ -z "$ARTIFACT_BUCKET" || "$ARTIFACT_BUCKET" == "None" ]]; then
     echo "WARN: Could not get artifact bucket from stack outputs, using convention..."
-    ARTIFACT_BUCKET="${INFRA_PROJECT_NAME}-${ENVIRONMENT}-${SERVICE_NAME}-artifacts-$(aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
+    ARTIFACT_BUCKET="${INFRA_PROJECT_NAME}-${ENVIRONMENT}-${SERVICE_NAME}-artifacts-$(retry_with_backoff aws sts get-caller-identity --query Account --output text --region "$AWS_REGION")"
 fi
 echo "Artifact bucket: ${ARTIFACT_BUCKET}"
 TMP_DIR=$(mktemp -d)
@@ -321,14 +338,14 @@ if [[ -d "${PROJECT_ROOT}/buildspecs" ]]; then
     fi
 fi
 (cd "$TMP_DIR" && zip -qr trigger.zip .)
-aws s3 cp "${TMP_DIR}/trigger.zip" "s3://${ARTIFACT_BUCKET}/trigger/trigger.zip" --region "$AWS_REGION"
+retry_with_backoff aws s3 cp "${TMP_DIR}/trigger.zip" "s3://${ARTIFACT_BUCKET}/trigger/trigger.zip" --region "$AWS_REGION"
 rm -rf "$TMP_DIR"
 echo "Trigger seeded."
 
 # Re-trigger pipeline (first auto-run fails because trigger.zip didn't exist yet)
 echo ""
 echo "Re-triggering pipeline..."
-aws codepipeline start-pipeline-execution \
+retry_with_backoff aws codepipeline start-pipeline-execution \
     --name "${INFRA_PROJECT_NAME}-${ENVIRONMENT}-${SERVICE_NAME}-pipeline" \
     --region "$AWS_REGION"
 echo "Pipeline triggered."
@@ -338,7 +355,7 @@ echo ""
 echo "============================================"
 echo "Project Outputs"
 echo "============================================"
-aws cloudformation describe-stacks \
+retry_with_backoff aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --region "$AWS_REGION" \
     --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' \

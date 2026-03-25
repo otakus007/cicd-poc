@@ -17,6 +17,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
+source "${SCRIPT_DIR}/lib/deploy-utils.sh"
 
 # Defaults
 INFRA_PROJECT_NAME="japfa-api"
@@ -28,6 +29,7 @@ FORCE_DELETE="false"
 RETAIN_LOGS="false"
 TEARDOWN_ALL="false"
 DELETE_SECRETS="false"
+DRY_RUN="false"
 
 usage() {
     cat << EOF
@@ -48,6 +50,7 @@ Optional:
     --region                AWS region (default: us-east-1)
     --profile               AWS CLI profile to use
     --force                 Skip confirmation prompts
+    --dry-run               Preview resources that would be deleted without performing deletions
     --retain-logs           Keep CloudWatch log groups
     --delete-secrets        Force-delete secrets immediately (skip 30-day recovery)
     -h, --help              Show help
@@ -55,6 +58,7 @@ Optional:
 Examples:
     $(basename "$0") -s hsbc -e dev
     $(basename "$0") -s hsbc -e dev --force --delete-secrets
+    $(basename "$0") -s hsbc -e dev --dry-run
     $(basename "$0") --all -e dev --force
 EOF
     exit 1
@@ -69,6 +73,7 @@ while [[ $# -gt 0 ]]; do
         --profile)          AWS_PROFILE="$2"; shift 2 ;;
         --force)            FORCE_DELETE="true"; shift ;;
         --retain-logs)      RETAIN_LOGS="true"; shift ;;
+        --dry-run)          DRY_RUN="true"; shift ;;
         --delete-secrets)   DELETE_SECRETS="true"; shift ;;
         --all)              TEARDOWN_ALL="true"; shift ;;
         -h|--help)          usage ;;
@@ -147,6 +152,112 @@ empty_versioned_bucket() {
     aws s3api delete-bucket --bucket "$bucket" $AWS_CLI_OPTS 2>/dev/null || true
 
     print_success "Bucket deleted: $bucket"
+}
+
+# =============================================================================
+# DRY-RUN REPORT
+# =============================================================================
+
+dry_run_report() {
+    local targets="$1"
+
+    print_header "Dry-Run: Project Resources That Would Be Deleted"
+
+    echo "  Environment:    $ENVIRONMENT"
+    echo "  Infra Name:     $INFRA_PROJECT_NAME"
+    echo "  Region:         $AWS_REGION"
+    echo "  Projects:      $targets"
+    echo ""
+
+    local grand_total_resources=0
+    local grand_total_cost=0
+
+    for svc in $targets; do
+        local stack_name="${INFRA_PROJECT_NAME}-${ENVIRONMENT}-${svc}"
+
+        echo ""
+        print_info "Project: ${svc} (Stack: ${stack_name})"
+
+        # Check stack exists
+        local stack_status
+        stack_status=$(get_stack_status "$stack_name")
+        if [[ "$stack_status" == "DOES_NOT_EXIST" ]]; then
+            print_warning "Stack '$stack_name' does not exist. Skipping."
+            continue
+        fi
+
+        # List all resources in the stack
+        local resources
+        resources=$(aws cloudformation list-stack-resources --stack-name "$stack_name" $AWS_CLI_OPTS \
+            --query 'StackResourceSummaries[*].[ResourceType,LogicalResourceId,PhysicalResourceId,ResourceStatus]' \
+            --output json 2>/dev/null)
+
+        if [[ -z "$resources" || "$resources" == "[]" || "$resources" == "null" ]]; then
+            print_warning "No resources found in stack."
+            continue
+        fi
+
+        # Count resources by type
+        local -A type_counts
+        local total_resources=0
+        local resource_types
+
+        resource_types=$(printf '%s' "$resources" | grep -o '"AWS::[^"]*"' | tr -d '"' | sort)
+
+        while IFS= read -r rtype; do
+            [[ -z "$rtype" ]] && continue
+            type_counts["$rtype"]=$(( ${type_counts["$rtype"]:-0} + 1 ))
+            total_resources=$((total_resources + 1))
+        done <<< "$resource_types"
+
+        # Display resource table with cost estimates
+        local total_cost=0
+
+        echo ""
+        echo "  Resources in Stack: ${stack_name}"
+        echo "  ============================================================"
+        printf "  %-50s %5s %10s\n" "Resource Type" "Count" "Est. Cost"
+        echo "  ------------------------------------------------------------"
+
+        local sorted_types
+        sorted_types=$(printf '%s\n' "${!type_counts[@]}" | sort)
+
+        while IFS= read -r rtype; do
+            [[ -z "$rtype" ]] && continue
+            local count="${type_counts[$rtype]}"
+            local unit_cost
+            unit_cost=$(get_resource_cost "$rtype")
+            local line_cost=$(( unit_cost * count ))
+            total_cost=$(( total_cost + line_cost ))
+
+            if [[ "$unit_cost" -eq 0 ]] && [[ -z "${_COST_MAP[$rtype]+_}" ]]; then
+                printf "  %-50s %5d %9s*\n" "$rtype" "$count" "\${line_cost}"
+            else
+                printf "  %-50s %5d %10s\n" "$rtype" "$count" "\${line_cost}"
+            fi
+        done <<< "$sorted_types"
+
+        echo "  ------------------------------------------------------------"
+        printf "  %-50s %5d %10s\n" "TOTAL" "$total_resources" "\${total_cost}/mo"
+        echo "  ============================================================"
+
+        grand_total_resources=$((grand_total_resources + total_resources))
+        grand_total_cost=$((grand_total_cost + total_cost))
+
+        # Clear associative array for next project
+        unset type_counts
+        declare -A type_counts
+    done
+
+    echo ""
+    echo "  * Cost not in mapping — shown as \$0. Actual cost may vary."
+    echo "  Note: Estimates are approximate monthly savings from teardown."
+    echo ""
+    print_info "Total resources across all projects: ${grand_total_resources}"
+    print_info "Estimated monthly cost savings: \${grand_total_cost}/mo"
+    echo ""
+    print_info "This is a dry run. No resources were deleted."
+    print_info "Remove --dry-run to perform the actual teardown."
 }
 
 # =============================================================================
@@ -429,6 +540,12 @@ main() {
         print_info "Found projects:$targets"
     else
         targets="$SERVICE_NAME"
+    fi
+
+    # Dry-run mode: list resources and exit without deleting
+    if [[ "$DRY_RUN" == "true" ]]; then
+        dry_run_report "$targets"
+        exit 0
     fi
 
     confirm_deletion "$targets"
