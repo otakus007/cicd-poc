@@ -1,0 +1,385 @@
+# Spectral OpenAPI Linting Ruleset
+# API Governance Configuration for CI/CD Pipeline
+#
+# IMPORTANT: Build never fails due to API governance violations.
+# Rationale: API specifications may depend on partner specifications,
+# so governance violations should be reported but not block deployments.
+#
+# Severity levels:
+#   error — Build-blocking violations that indicate a fundamentally broken API
+#           contract (GET/DELETE with request body, missing security schemes).
+#           These will fail the build and trigger SNS notification.
+#   warn  — Mandatory standards from the API governance policy (naming, security,
+#           HTTP methods, status codes, content types, error format, versioning).
+#           These map to policy sections 3–6 and should be addressed.
+#   info  — Documentation quality, best-practice suggestions, and recommendations
+#           (descriptions, pagination hints, UUID format, timestamp format,
+#           header casing, server version URL). Nice to have, not blocking.
+#
+# Validates: Requirements 3.3, 3.4, 3.6
+# - 3.3: Check naming conventions for API endpoints, parameters, and response schemas
+# - 3.4: Check that all endpoints have proper security definitions
+# - 3.6: Validate against RESTful API Design Standards
+
+extends: ["spectral:oas"]
+
+# Override all built-in rules to warning severity
+rules:
+  # ============================================================================
+  # BUILT-IN RULES - Override to warning severity
+  # These rules extend spectral:oas and only need severity override
+  # ============================================================================
+
+  # Operation ID requirement (built-in rule override)
+  operation-operationId: warn
+
+  # Operation description requirement (built-in rule override)
+  operation-description: info
+
+  # Operation tags requirement (built-in rule override)
+  operation-tags: info
+
+  # Info contact requirement (built-in rule override)
+  info-contact: info
+
+  # Info license requirement (built-in rule override)
+  info-license: info
+
+  # Tag description requirement (built-in rule override)
+  tag-description: info
+
+  # ============================================================================
+  # NAMING CONVENTIONS (Requirement 3.3)
+  # RESTful API Design Standards - Resource Naming
+  # ============================================================================
+
+  # Path parameters should use camelCase
+  path-params-camel-case:
+    severity: warn
+    message: "Path parameters should use camelCase naming convention"
+    given: "$.paths[*].parameters[?(@.in=='path')].name"
+    then:
+      function: casing
+      functionOptions:
+        type: camel
+
+  # Query parameters should use camelCase
+  query-params-camel-case:
+    severity: warn
+    message: "Query parameters should use camelCase naming convention (e.g., sortBy, filterBy)"
+    given: "$.paths[*][*].parameters[?(@.in=='query')].name"
+    then:
+      function: casing
+      functionOptions:
+        type: camel
+
+  # Header parameters should use proper HTTP header casing
+  header-params-pascal-kebab-case:
+    severity: info
+    message: "Header parameters should use Pascal-Kebab-Case (e.g., X-Request-Id)"
+    given: "$.paths[*][*].parameters[?(@.in=='header')].name"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^[A-Z][a-zA-Z0-9]*(-[A-Z][a-zA-Z0-9]*)*$"
+
+  # Schema property names should use camelCase
+  schema-properties-camel-case:
+    severity: warn
+    message: "Schema properties should use camelCase naming convention"
+    given: "$.components.schemas[*].properties[*]~"
+    then:
+      function: casing
+      functionOptions:
+        type: camel
+
+  # Paths should use lowercase with hyphens for multi-word resources
+  paths-kebab-case:
+    severity: warn
+    message: "Path segments should use lowercase with hyphens (kebab-case) for multi-word resources"
+    given: "$.paths[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^(\\/[a-z0-9-{}]+)+$"
+
+  # Paths should not contain verbs (resource-oriented design)
+  paths-no-verbs:
+    severity: warn
+    message: "Paths should not contain action verbs (use HTTP methods instead). Exceptions: reset-password, export"
+    given: "$.paths[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        notMatch: "\\/(get|create|update|delete|remove|add|fetch|retrieve|list|find|search|save|modify|edit|insert)[A-Z-]"
+
+  # ============================================================================
+  # SECURITY DEFINITIONS (Requirement 3.4)
+  # ============================================================================
+
+  # All operations should have security defined
+  security-defined:
+    severity: warn
+    message: "Operations should have security definitions (authentication requirements)"
+    given: "$.paths[*][get,post,put,patch,delete]"
+    then:
+      field: security
+      function: truthy
+
+  # Global security should be defined
+  global-security-defined:
+    severity: warn
+    message: "API should have global security definitions"
+    given: "$"
+    then:
+      field: security
+      function: truthy
+
+  # Security schemes should be defined in components
+  security-schemes-defined:
+    severity: error
+    message: "API MUST define security schemes in components — shipping without auth is a security gap"
+    given: "$.components"
+    then:
+      field: securitySchemes
+      function: truthy
+
+  # ============================================================================
+  # HTTP METHODS AND STATUS CODES (Requirement 3.6)
+  # RESTful API Design Standards - HTTP Method Usage
+  # ============================================================================
+
+  # GET operations should not have request body
+  get-no-request-body:
+    severity: error
+    message: "GET operations MUST NOT have a request body — breaks proxies, caches, and HTTP clients"
+    given: "$.paths[*].get"
+    then:
+      field: requestBody
+      function: falsy
+
+  # DELETE operations should not have request body
+  delete-no-request-body:
+    severity: error
+    message: "DELETE operations MUST NOT have a request body — breaks proxies, caches, and HTTP clients"
+    given: "$.paths[*].delete"
+    then:
+      field: requestBody
+      function: falsy
+
+  # POST operations should have request body
+  post-request-body-required:
+    severity: warn
+    message: "POST operations should have a request body"
+    given: "$.paths[*].post"
+    then:
+      field: requestBody
+      function: truthy
+
+  # PUT operations should have request body
+  put-request-body-required:
+    severity: warn
+    message: "PUT operations should have a request body"
+    given: "$.paths[*].put"
+    then:
+      field: requestBody
+      function: truthy
+
+  # ============================================================================
+  # RESPONSE FORMAT STANDARDS (Requirement 3.6)
+  # RESTful API Design Standards - Response Formats
+  # ============================================================================
+
+  # All responses should have descriptions
+  response-description:
+    severity: warn
+    message: "All responses should have descriptions"
+    given: "$.paths[*][*].responses[*]"
+    then:
+      field: description
+      function: truthy
+
+  # Success responses should have content defined
+  success-response-content:
+    severity: warn
+    message: "Success responses (2xx) should have content defined"
+    given: "$.paths[*][*].responses[200,201]"
+    then:
+      field: content
+      function: truthy
+
+  # POST 201 responses should exist for create operations
+  post-201-response:
+    severity: warn
+    message: "POST operations should return 201 Created for successful resource creation"
+    given: "$.paths[*].post.responses"
+    then:
+      field: "201"
+      function: truthy
+
+  # DELETE should have 204 response
+  delete-204-response:
+    severity: warn
+    message: "DELETE operations should return 204 No Content for successful deletion"
+    given: "$.paths[*].delete.responses"
+    then:
+      field: "204"
+      function: truthy
+
+  # ============================================================================
+  # DOCUMENTATION QUALITY
+  # ============================================================================
+
+  # API should have a description
+  info-description:
+    severity: info
+    message: "API should have a description in the info section"
+    given: "$.info"
+    then:
+      field: description
+      function: truthy
+
+  # Parameters should have descriptions
+  parameter-description:
+    severity: info
+    message: "Parameters should have descriptions"
+    given: "$.paths[*][*].parameters[*]"
+    then:
+      field: description
+      function: truthy
+
+  # Request body should have description
+  request-body-description:
+    severity: info
+    message: "Request bodies should have descriptions"
+    given: "$.paths[*][*].requestBody"
+    then:
+      field: description
+      function: truthy
+
+  # Schemas should have descriptions
+  schema-description:
+    severity: info
+    message: "Schemas should have descriptions"
+    given: "$.components.schemas[*]"
+    then:
+      field: description
+      function: truthy
+
+  # ============================================================================
+  # CONTENT TYPE STANDARDS
+  # RESTful API Design Standards - application/json requirement
+  # ============================================================================
+
+  # Request content should be application/json
+  request-content-type-json:
+    severity: warn
+    message: "Request content should use application/json"
+    given: "$.paths[*][*].requestBody.content"
+    then:
+      field: "application/json"
+      function: truthy
+
+  # Response content should be application/json
+  response-content-type-json:
+    severity: warn
+    message: "Response content should use application/json"
+    given: "$.paths[*][*].responses[*].content"
+    then:
+      field: "application/json"
+      function: truthy
+
+  # ============================================================================
+  # PAGINATION STANDARDS
+  # RESTful API Design Standards - Pagination for list endpoints
+  # ============================================================================
+
+  # List endpoints should support pagination parameters
+  list-pagination-parameters:
+    severity: info
+    message: "List endpoints (GET on collection resources) should support pagination parameters"
+    description: "Collection endpoints should include page/pageSize or offset/limit query parameters"
+    given: "$.paths[?(@property.match(/\\/[a-z-]+s$/))].get"
+    then:
+      field: parameters
+      function: truthy
+
+  # ============================================================================
+  # VERSIONING STANDARDS
+  # RESTful API Design Standards - URI path versioning
+  # ============================================================================
+
+  # API version should be in path
+  api-version-in-path:
+    severity: warn
+    message: "API paths should include version prefix (e.g., /v1/resource)"
+    given: "$.paths[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^(\\/v[0-9]+\\/)|(^\\/health$)|(^\\/docs)|(^\\/openapi)"
+
+  # Servers should include version
+  servers-version:
+    severity: info
+    message: "Server URLs should include API version"
+    given: "$.servers[*].url"
+    then:
+      function: pattern
+      functionOptions:
+        match: "\\/v[0-9]+$|\\/v[0-9]+\\/"
+
+  # ============================================================================
+  # IDENTIFIER FORMAT STANDARDS
+  # RESTful API Design Standards - UUID for identifiers
+  # ============================================================================
+
+  # ID parameters should use UUID format
+  id-parameter-uuid-format:
+    severity: info
+    message: "ID path parameters should use UUID format for public APIs"
+    given: "$.paths[*].parameters[?(@.in=='path' && @.name.match(/[iI]d$/))].schema"
+    then:
+      field: format
+      function: pattern
+      functionOptions:
+        match: "^uuid$"
+
+  # ============================================================================
+  # TIMESTAMP FORMAT STANDARDS
+  # RESTful API Design Standards - ISO 8601 timestamps
+  # ============================================================================
+
+  # Date-time properties should use ISO 8601 format
+  datetime-format-iso8601:
+    severity: info
+    message: "Date-time properties should use date-time format (ISO 8601)"
+    given: "$.components.schemas[*].properties[?(@property.match(/(date|time|At|On)$/i))]"
+    then:
+      field: format
+      function: pattern
+      functionOptions:
+        match: "^date-time$|^date$"
+
+  # ============================================================================
+  # ERROR RESPONSE FORMAT (RFC 9457)
+  # RESTful API Design Standards - Problem Details format
+  # ============================================================================
+
+  # Error responses should follow RFC 9457 Problem Details format
+  error-response-problem-details:
+    severity: warn
+    message: "Error responses should follow RFC 9457 Problem Details format with type, title, status, detail fields"
+    given: "$.paths[*][*].responses[?(@property >= 400 && @property < 600)].content['application/json'].schema"
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          properties:
+            $ref:
+              type: string
+          anyOf:
+            - required: ["type"]
+            - required: ["title"]
+            - required: ["status"]
