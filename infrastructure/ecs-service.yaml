@@ -34,6 +34,37 @@ Parameters:
     Type: String
   HealthCheckGracePeriod:
     Type: Number
+  MinTaskCount:
+    Type: Number
+    Default: 1
+    Description: Minimum number of ECS tasks for auto-scaling
+  MaxTaskCount:
+    Type: Number
+    Default: 4
+    Description: Maximum number of ECS tasks for auto-scaling
+  EnableServiceConnect:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable ECS Service Connect for service-to-service communication (opt-out for dev)
+  EnableExecuteCommand:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable ECS Exec for interactive debugging (true for dev/staging, false for prod)
+  ServiceConnectNamespace:
+    Type: String
+    Default: ""
+    Description: Cloud Map namespace ARN for Service Connect
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+  IsServiceConnectEnabled: !Equals [!Ref EnableServiceConnect, "true"]
 
 Resources:
   TargetGroup:
@@ -61,6 +92,8 @@ Resources:
           Value: !Ref Environment
         - Key: Service
           Value: !Ref ServiceName
+        - Key: ComputeType
+          Value: fargate
 
   ListenerRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
@@ -85,6 +118,7 @@ Resources:
       DesiredCount: !Ref DesiredCount
       HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriod
       LaunchType: FARGATE
+      EnableExecuteCommand: !If [IsProduction, false, true]
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
@@ -97,6 +131,17 @@ Resources:
         - ContainerName: !Sub ${ServiceName}-container
           ContainerPort: !Ref ContainerPort
           TargetGroupArn: !Ref TargetGroup
+      ServiceConnectConfiguration:
+        !If
+          - IsServiceConnectEnabled
+          - Enabled: true
+            Namespace: !Ref ServiceConnectNamespace
+            Services:
+              - PortName: !Sub ${ServiceName}-port
+                ClientAliases:
+                  - Port: !Ref ContainerPort
+                    DnsName: !Sub "${ServiceName}"
+          - Enabled: false
       DeploymentConfiguration:
         MinimumHealthyPercent: 50
         MaximumPercent: 200
@@ -108,9 +153,41 @@ Resources:
           Value: !Ref Environment
         - Key: Service
           Value: !Ref ServiceName
+        - Key: ComputeType
+          Value: fargate
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Join
+        - /
+        - - service
+          - !Select [1, !Split ["/", !Ref ClusterArn]]
+          - !GetAtt EcsService.Name
+      MinCapacity: !If [IsDevelopment, 1, 2]
+      MaxCapacity: !Ref MaxTaskCount
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-${ServiceName}-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
 
 Outputs:
   ServiceName:
     Value: !GetAtt EcsService.Name
   TargetGroupArn:
     Value: !Ref TargetGroup
+  ScalableTargetArn:
+    Value: !Ref ScalableTarget
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-${ServiceName}-ScalableTargetArn

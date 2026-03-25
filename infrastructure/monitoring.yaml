@@ -19,6 +19,10 @@ Metadata:
           - PipelineArn
           - ClusterName
       - Label:
+          default: "API Gateway Configuration"
+        Parameters:
+          - ApiGatewayName
+      - Label:
           default: "ECS Service Configuration"
         Parameters:
           - ServiceName
@@ -27,6 +31,16 @@ Metadata:
         Parameters:
           - LoadBalancerFullName
           - TargetGroupFullName
+      - Label:
+          default: "ECS Service ARN"
+        Parameters:
+          - EcsServiceArn
+      - Label:
+          default: "Log Group Configuration"
+        Parameters:
+          - CodeBuildLogGroupPrefix
+          - EcsLogGroupName
+          - ApiGatewayLogGroupName
       - Label:
           default: "Notification Configuration"
         Parameters:
@@ -62,6 +76,26 @@ Parameters:
   ClusterName:
     Type: String
     Default: ""
+  ApiGatewayName:
+    Type: String
+    Default: ""
+    Description: "Name of the API Gateway for anomaly detection metrics"
+  EcsServiceArn:
+    Type: String
+    Default: ""
+    Description: "ARN of the ECS service for composite alarm dimensions"
+  CodeBuildLogGroupPrefix:
+    Type: String
+    Default: ""
+    Description: "Log group name prefix for CodeBuild projects (e.g., /aws/codebuild/myproject)"
+  EcsLogGroupName:
+    Type: String
+    Default: ""
+    Description: "CloudWatch Log Group name for ECS container logs"
+  ApiGatewayLogGroupName:
+    Type: String
+    Default: ""
+    Description: "CloudWatch Log Group name for API Gateway access logs"
   NotificationEmail:
     Type: String
     Default: ""
@@ -108,6 +142,7 @@ Parameters:
     MinValue: 1
 
 Conditions:
+  HasApiGatewayName: !Not [!Equals [!Ref ApiGatewayName, ""]]
   HasPipelineName: !Not [!Equals [!Ref PipelineName, ""]]
   HasPipelineArn: !Not [!Equals [!Ref PipelineArn, ""]]
   HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
@@ -121,6 +156,12 @@ Conditions:
   CanCreateAlbAlarms: !And
     - !Condition HasLoadBalancerFullName
     - !Condition HasTargetGroupFullName
+  CanCreateCompositeAlarm: !And
+    - !Condition CanCreateEcsAlarms
+    - !Condition CanCreateAlbAlarms
+  HasCodeBuildLogGroupPrefix: !Not [!Equals [!Ref CodeBuildLogGroupPrefix, ""]]
+  HasEcsLogGroupName: !Not [!Equals [!Ref EcsLogGroupName, ""]]
+  HasApiGatewayLogGroupName: !Not [!Equals [!Ref ApiGatewayLogGroupName, ""]]
 
 Resources:
   PipelineNotificationTopic:
@@ -167,6 +208,15 @@ Resources:
             Effect: Allow
             Principal:
               Service: codestar-notifications.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PipelineNotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
             Action: sns:Publish
             Resource: !Ref PipelineNotificationTopic
             Condition:
@@ -274,8 +324,9 @@ Resources:
     Condition: HasPipelineName
     Properties:
       Name: !Sub ${ProjectName}-${Environment}-azure-devops-webhook
-      Authentication: UNAUTHENTICATED
-      AuthenticationConfiguration: {}
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Sub '{{resolve:secretsmanager:${ProjectName}-${Environment}-webhook-secret:SecretString}}'
       Filters:
         - JsonPath: "$.resource.refUpdates[0].name"
           MatchEquals: "refs/heads/{Branch}"
@@ -471,6 +522,113 @@ Resources:
       AlarmActions: [!Ref PipelineNotificationTopic]
       OKActions: [!Ref PipelineNotificationTopic]
 
+  EcsServiceHealthCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Condition: CanCreateCompositeAlarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-ecs-service-health-composite-alarm
+      AlarmDescription: !Sub "Composite alarm for ${ProjectName} ${Environment} ECS service health. Triggers when at least 2 of 3 alarms (CPU, Memory, UnhealthyHost) are in ALARM state."
+      AlarmRule: !Sub >-
+        (ALARM("${ProjectName}-${Environment}-ecs-cpu-alarm") AND ALARM("${ProjectName}-${Environment}-ecs-memory-alarm"))
+        OR (ALARM("${ProjectName}-${Environment}-ecs-cpu-alarm") AND ALARM("${ProjectName}-${Environment}-alb-unhealthy-hosts-alarm"))
+        OR (ALARM("${ProjectName}-${Environment}-ecs-memory-alarm") AND ALARM("${ProjectName}-${Environment}-alb-unhealthy-hosts-alarm"))
+      AlarmActions:
+        - !Ref PipelineNotificationTopic
+      OKActions:
+        - !Ref PipelineNotificationTopic
+    DependsOn:
+      - EcsCpuUtilizationAlarm
+      - EcsMemoryUtilizationAlarm
+      - AlbUnhealthyHostAlarm
+
+  ApiGatewayLatencyAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Condition: HasApiGatewayName
+    Properties:
+      Namespace: AWS/ApiGateway
+      MetricName: IntegrationLatency
+      Stat: Average
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ApiGatewayName
+
+  ApiGatewayLatencyAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasApiGatewayName
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-api-gateway-latency-anomaly-alarm
+      AlarmDescription: !Sub "API Gateway integration latency exceeds anomaly detection band for ${ProjectName} ${Environment}"
+      ComparisonOperator: GreaterThanUpperThreshold
+      EvaluationPeriods: 3
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: IntegrationLatency
+              Dimensions:
+                - Name: ApiName
+                  Value: !Ref ApiGatewayName
+            Period: 300
+            Stat: Average
+          ReturnData: true
+        - Id: ad1
+          Expression: ANOMALY_DETECTION_BAND(m1)
+          Label: IntegrationLatency (Expected)
+          ReturnData: false
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PipelineNotificationTopic
+      OKActions:
+        - !Ref PipelineNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-api-gateway-latency-anomaly-alarm
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PipelineStageFailuresQuery:
+    Type: AWS::Logs::QueryDefinition
+    Condition: HasCodeBuildLogGroupPrefix
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment} - Pipeline Stage Failures in Last 24h"
+      QueryString: |
+        fields @timestamp, @message, @logStream
+        | filter @message like /(?i)(error|failure|failed|exception|BUILD_FAILED)/
+        | sort @timestamp desc
+        | limit 50
+      LogGroupNames:
+        - !Ref CodeBuildLogGroupPrefix
+
+  EcsTaskStopReasonsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Condition: HasEcsLogGroupName
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment} - ECS Task Stop Reasons"
+      QueryString: |
+        fields @timestamp, @message, @logStream
+        | filter @message like /(?i)(stopped|stop reason|task stopped|exit code|OOMKilled|essential container)/
+        | sort @timestamp desc
+        | limit 50
+      LogGroupNames:
+        - !Ref EcsLogGroupName
+
+  ApiGateway5xxErrorsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Condition: HasApiGatewayLogGroupName
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment} - API Gateway 5xx Errors"
+      QueryString: |
+        fields @timestamp, httpMethod, path, status, responseLatency, errorMessage
+        | filter status >= 500 and status < 600
+        | sort @timestamp desc
+        | limit 50
+      LogGroupNames:
+        - !Ref ApiGatewayLogGroupName
+
 Outputs:
   NotificationTopicArn:
     Description: SNS Topic ARN for pipeline notifications
@@ -565,4 +723,11 @@ Outputs:
     Value: !GetAtt AlbHttp5xxErrorAlarm.Arn
     Export:
       Name: !Sub ${ProjectName}-${Environment}-AlbHttp5xxErrorAlarmArn
+
+  EcsServiceHealthCompositeAlarmArn:
+    Description: ECS Service Health Composite Alarm ARN
+    Condition: CanCreateCompositeAlarm
+    Value: !GetAtt EcsServiceHealthCompositeAlarm.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-EcsServiceHealthCompositeAlarmArn
 
