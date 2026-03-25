@@ -33,12 +33,18 @@ Parameters:
   EcrRepositoryUri:
     Type: String
 
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+
 Resources:
   SourceBuildLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-${ServiceName}-source
-      RetentionInDays: 30
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
+      RetentionInDays: !If [IsProduction, 90, 14]
 
   SourceProject:
     Type: AWS::CodeBuild::Project
@@ -51,6 +57,7 @@ Resources:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
         EnvironmentVariables:
           - Name: AZURE_DEVOPS_ORGANIZATION
             Value: !Ref AzureDevOpsOrganization
@@ -81,12 +88,14 @@ Resources:
           Status: ENABLED
           GroupName: !Ref SourceBuildLogGroup
       TimeoutInMinutes: 15
+      ConcurrentBuildLimit: !If [IsDevelopment, 1, !Ref "AWS::NoValue"]
 
   SwaggerGenLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-${ServiceName}-swagger-gen
-      RetentionInDays: 30
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
+      RetentionInDays: !If [IsProduction, 90, 14]
 
   SwaggerGenProject:
     Type: AWS::CodeBuild::Project
@@ -99,6 +108,7 @@ Resources:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
         EnvironmentVariables:
           - Name: PROJECT_NAME
             Value: !Ref ProjectName
@@ -116,12 +126,14 @@ Resources:
           Status: ENABLED
           GroupName: !Ref SwaggerGenLogGroup
       TimeoutInMinutes: 15
+      ConcurrentBuildLimit: !If [IsDevelopment, 1, !Ref "AWS::NoValue"]
 
   LintLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-${ServiceName}-lint
-      RetentionInDays: 30
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
+      RetentionInDays: !If [IsProduction, 90, 14]
 
   LintProject:
     Type: AWS::CodeBuild::Project
@@ -134,6 +146,7 @@ Resources:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
         EnvironmentVariables:
           - Name: PROJECT_NAME
             Value: !Ref ProjectName
@@ -153,12 +166,56 @@ Resources:
           Status: ENABLED
           GroupName: !Ref LintLogGroup
       TimeoutInMinutes: 10
+      ConcurrentBuildLimit: !If [IsDevelopment, 1, !Ref "AWS::NoValue"]
+
+  SecurityScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-${ServiceName}-security-scan
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
+      RetentionInDays: !If [IsProduction, 90, 14]
+
+  SecurityScanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-${ServiceName}-security-scan
+      ServiceRole: !Ref CodeBuildRoleArn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SERVICE_NAME
+            Value: !Ref ServiceName
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REPO
+            Value: !Ref EcrRepositoryUri
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-security-scan.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref SecurityScanLogGroup
+      TimeoutInMinutes: 15
+      ConcurrentBuildLimit: !If [IsDevelopment, 1, !Ref "AWS::NoValue"]
 
   BuildLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-${ServiceName}-build
-      RetentionInDays: 30
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
+      RetentionInDays: !If [IsProduction, 90, 14]
 
   BuildProject:
     Type: AWS::CodeBuild::Project
@@ -179,6 +236,16 @@ Resources:
             Value: !Ref Environment
           - Name: SERVICE_NAME
             Value: !Ref ServiceName
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REPO
+            Value: !Ref EcrRepositoryUri
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
       Source:
         Type: CODEPIPELINE
         BuildSpec: buildspecs/buildspec-build.yml
@@ -187,52 +254,14 @@ Resources:
           Status: ENABLED
           GroupName: !Ref BuildLogGroup
       TimeoutInMinutes: 30
-
-  PushLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-${ServiceName}-push
-      RetentionInDays: 30
-
-  PushProject:
-    Type: AWS::CodeBuild::Project
-    Properties:
-      Name: !Sub ${ProjectName}-${Environment}-${ServiceName}-push
-      ServiceRole: !Ref CodeBuildRoleArn
-      Artifacts:
-        Type: CODEPIPELINE
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
-        PrivilegedMode: true
-        EnvironmentVariables:
-          - Name: AWS_ACCOUNT_ID
-            Value: !Ref AWS::AccountId
-          - Name: AWS_REGION
-            Value: !Ref AWS::Region
-          - Name: ECR_REPO
-            Value: !Sub ${ProjectName}-${Environment}-${ServiceName}
-          - Name: PROJECT_NAME
-            Value: !Ref ProjectName
-          - Name: ENVIRONMENT
-            Value: !Ref Environment
-          - Name: SERVICE_NAME
-            Value: !Ref ServiceName
-      Source:
-        Type: CODEPIPELINE
-        BuildSpec: buildspecs/buildspec-push.yml
-      LogsConfig:
-        CloudWatchLogs:
-          Status: ENABLED
-          GroupName: !Ref PushLogGroup
-      TimeoutInMinutes: 15
+      ConcurrentBuildLimit: !If [IsDevelopment, 1, !Ref "AWS::NoValue"]
 
   ContractTestLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/codebuild/${ProjectName}-${Environment}-${ServiceName}-contract-test
-      RetentionInDays: 30
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
+      RetentionInDays: !If [IsProduction, 90, 14]
 
   ContractTestProject:
     Type: AWS::CodeBuild::Project
@@ -245,6 +274,7 @@ Resources:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
         EnvironmentVariables:
           - Name: PROJECT_NAME
             Value: !Ref ProjectName
@@ -264,6 +294,7 @@ Resources:
           Status: ENABLED
           GroupName: !Ref ContractTestLogGroup
       TimeoutInMinutes: 15
+      ConcurrentBuildLimit: !If [IsDevelopment, 1, !Ref "AWS::NoValue"]
 
 Outputs:
   SourceProjectName:
@@ -272,9 +303,9 @@ Outputs:
     Value: !Ref SwaggerGenProject
   LintProjectName:
     Value: !Ref LintProject
+  SecurityScanProjectName:
+    Value: !Ref SecurityScanProject
   BuildProjectName:
     Value: !Ref BuildProject
-  PushProjectName:
-    Value: !Ref PushProject
   ContractTestProjectName:
     Value: !Ref ContractTestProject

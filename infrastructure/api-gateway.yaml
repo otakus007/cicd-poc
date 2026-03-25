@@ -132,8 +132,8 @@ Parameters:
 
   CorsAllowOrigins:
     Type: CommaDelimitedList
-    Description: Comma-separated list of allowed CORS origins
-    Default: "*"
+    Description: Comma-separated list of allowed CORS origins (set specific origins for staging/prod)
+    Default: "https://app.japfa.com.vn,http://localhost:3000"
 
   CorsMaxAge:
     Type: Number
@@ -163,12 +163,25 @@ Parameters:
     Description: (Deprecated) Single pipeline ARN - webhook now supports multiple pipelines
     Default: ""
 
+  WebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret token for Azure DevOps webhook authentication
+    Default: "change-me-in-production"
+
+  WebhookSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the Azure DevOps webhook secret for authorizer validation
+    Default: ""
+
 # =============================================================================
 # CONDITIONS
 # =============================================================================
 Conditions:
   # Webhook is always enabled - supports multiple pipelines via /webhook/{service}
   EnableWebhook: !Equals ["true", "true"]
+  IsProduction: !Equals [!Ref Environment, "prod"]
+  IsStaging: !Equals [!Ref Environment, "staging"]
 
 # =============================================================================
 # RESOURCES
@@ -318,7 +331,8 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/apigateway/${ProjectName}-${Environment}-api-gateway
-      RetentionInDays: 90
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
+      RetentionInDays: !If [IsProduction, 90, !If [IsStaging, 30, 14]]
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -398,14 +412,26 @@ Resources:
         Variables:
           ENVIRONMENT: !Ref Environment
           PROJECT_NAME: !Ref ProjectName
+          WEBHOOK_SECRET: !Ref WebhookSecret
       Code:
         ZipFile: |
-          import json,os,boto3,logging
+          import json,os,boto3,logging,hmac,hashlib
           logger=logging.getLogger()
           logger.setLevel(logging.INFO)
           cp=boto3.client('codepipeline')
           def handler(e,c):
             try:
+              h=e.get('headers',{})
+              # Check signature for security
+              sig=h.get('x-hub-signature-256','')
+              body=e.get('body','')
+              secret=os.environ.get('WEBHOOK_SECRET','')
+              if secret and secret != 'change-me-in-production':
+                expected=hmac.new(secret.encode(),body.encode(),hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(f"sha256={expected}",sig):
+                  logger.warning("Invalid signature")
+                  return{'statusCode':401,'body':json.dumps({'error':'Unauthorized'})}
+              
               # Get service name from path parameter
               pp=e.get('pathParameters',{}) or {}
               svc=pp.get('service','')
@@ -413,7 +439,6 @@ Resources:
                 return{'statusCode':400,'body':json.dumps({'error':'Missing service in path. Use /webhook/{service}'})}
               
               # Check event type from Azure DevOps headers
-              h=e.get('headers',{})
               et=h.get('x-azure-devops-event',h.get('X-Azure-DevOps-Event',''))
               logger.info(f"Webhook received: service={svc}, event={et}")
               
@@ -455,12 +480,117 @@ Resources:
       IntegrationUri: !GetAtt WebhookLambdaFunction.Arn
       PayloadFormatVersion: "2.0"
 
+  # ---------------------------------------------------------------------------
+  # Lambda Authorizer for Webhook Route
+  # Finding 1.1: Validates Azure DevOps webhook secret from Secrets Manager
+  # ---------------------------------------------------------------------------
+  WebhookAuthorizerRole:
+    Type: AWS::IAM::Role
+    Condition: EnableWebhook
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-webhook-authorizer-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecretArn
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-webhook-authorizer-role
+        - Key: Environment
+          Value: !Ref Environment
+
+  WebhookAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableWebhook
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-webhook-authorizer
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WebhookAuthorizerRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+      Code:
+        ZipFile: |
+          import json,os,boto3,hmac,hashlib,logging
+          logger=logging.getLogger()
+          logger.setLevel(logging.INFO)
+          sm=boto3.client('secretsmanager')
+          _secret=None
+          def get_secret():
+            global _secret
+            if _secret is None:
+              r=sm.get_secret_value(SecretId=os.environ['WEBHOOK_SECRET_ARN'])
+              _secret=r['SecretString']
+            return _secret
+          def handler(e,c):
+            try:
+              h=e.get('headers',{}) or {}
+              sig=h.get('x-hub-signature','') or h.get('X-Hub-Signature','')
+              body=e.get('body','') or ''
+              secret=get_secret()
+              if sig:
+                expected=hmac.new(secret.encode(),body.encode(),hashlib.sha256).hexdigest()
+                if hmac.compare_digest(f"sha256={expected}",sig):
+                  return{"isAuthorized":True}
+              auth=h.get('authorization','') or h.get('Authorization','')
+              if auth and hmac.compare_digest(auth,secret):
+                return{"isAuthorized":True}
+              logger.warning("Webhook authorization failed")
+              return{"isAuthorized":False}
+            except Exception as x:
+              logger.error(f"Authorizer error: {x}")
+              return{"isAuthorized":False}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-webhook-authorizer
+        - Key: Environment
+          Value: !Ref Environment
+
+  WebhookAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableWebhook
+    Properties:
+      FunctionName: !Ref WebhookAuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*
+
+  WebhookAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: EnableWebhook
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-webhook-authorizer
+      ApiId: !Ref HttpApi
+      AuthorizerType: REQUEST
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebhookAuthorizerFunction.Arn}/invocations
+      AuthorizerPayloadFormatVersion: "2.0"
+      EnableSimpleResponses: true
+
   WebhookRoute:
     Type: AWS::ApiGatewayV2::Route
     Condition: EnableWebhook
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: POST /webhook/{service}
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref WebhookAuthorizer
       Target: !Sub integrations/${WebhookIntegration}
 
   WebhookLambdaLogGroup:
@@ -468,7 +598,113 @@ Resources:
     Condition: EnableWebhook
     Properties:
       LogGroupName: !Sub /aws/lambda/${ProjectName}-${Environment}-webhook-handler
+      KmsKeyId: !If [IsProduction, !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch", !Ref "AWS::NoValue"]
       RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # Webhook Lambda Error Alarm
+  # Finding 2.4: Notifies if the webhook trigger fails
+  # ---------------------------------------------------------------------------
+  WebhookLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableWebhook
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-webhook-errors
+      AlarmDescription: Alarm if the Azure DevOps webhook handler fails
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WebhookLambdaFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-NotificationTopicArn
+
+  # ---------------------------------------------------------------------------
+  # WAF WebACL for API Gateway (Production only)
+  # Finding 1.14: Protects API Gateway against common web attacks
+  # ---------------------------------------------------------------------------
+  WafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: IsProduction
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-api-waf
+      Description: !Sub WAF WebACL for ${ProjectName} ${Environment} API Gateway
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${ProjectName}-${Environment}-api-waf
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${ProjectName}-${Environment}-common-rules
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${ProjectName}-${Environment}-bad-inputs-rules
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${ProjectName}-${Environment}-sqli-rules
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 4
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${ProjectName}-${Environment}-ip-reputation-rules
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: API Gateway WAF Protection
+
+  WafWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: IsProduction
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/apis/${HttpApi}/stages/$default
+      WebACLArn: !GetAtt WafWebAcl.Arn
 
 # =============================================================================
 # OUTPUTS

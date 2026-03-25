@@ -68,7 +68,7 @@ Parameters:
   ContainerInsightsEnabled:
     Type: String
     Description: Enable Container Insights for monitoring (enabled/disabled)
-    Default: enabled
+    Default: disabled
     AllowedValues:
       - enabled
       - disabled
@@ -170,6 +170,12 @@ Resources:
         # Requirement 3.2: ComputeType tag for cost tracking
         - Key: ComputeType
           Value: !Ref ComputeType
+        # Finding 1.27: Savings Plan tagging for staging/prod
+        - !If
+          - IsDevelopment
+          - !Ref AWS::NoValue
+          - Key: SavingsPlanEligible
+            Value: "true"
 
   # ---------------------------------------------------------------------------
   # CloudWatch Log Group for ECS Container Logs
@@ -180,6 +186,10 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /ecs/${ProjectName}-${Environment}
+      KmsKeyId: !If
+        - IsProduction
+        - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch
+        - !Ref AWS::NoValue
       RetentionInDays: !If
         - IsProduction
         - 90
@@ -208,6 +218,10 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/ecs/containerinsights/${ProjectName}-${Environment}-cluster/performance
+      KmsKeyId: !If
+        - IsProduction
+        - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/cloudwatch
+        - !Ref AWS::NoValue
       RetentionInDays: !If
         - IsProduction
         - 90
@@ -227,6 +241,27 @@ Resources:
         # Requirement 3.2: ComputeType tag for cost tracking
         - Key: ComputeType
           Value: !Ref ComputeType
+
+  # ---------------------------------------------------------------------------
+  # Fargate Spot Interruption Alarm
+  # Requirement 3.7: Track Fargate Spot interruptions
+  # ---------------------------------------------------------------------------
+  FargateSpotInterruptionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-fargate-spot-interruption
+      AlarmDescription: Alarm when Fargate Spot tasks are interrupted
+      Namespace: AWS/ECS
+      MetricName: CpuUtilized
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EcsCluster
+      Statistic: SampleCount
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
 
 # =============================================================================
 # OUTPUTS

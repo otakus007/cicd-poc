@@ -4,29 +4,81 @@ Description: ECR Repository Stack for CI/CD Pipeline (Per-Project Nested Stack).
 Parameters:
   Environment:
     Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
   ProjectName:
     Type: String
+    Default: japfa-api
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 32
   ServiceName:
     Type: String
+
+Conditions:
+  IsProduction:
+    !Equals [!Ref Environment, prod]
 
 Resources:
   EcrRepository:
     Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      RepositoryName: !Sub ${ProjectName}-${Environment}-${ServiceName}
+      RepositoryName: !Sub ${ProjectName}-${Environment}
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageTagMutability: !If [IsProduction, IMMUTABLE, MUTABLE]
       ImageScanningConfiguration:
         ScanOnPush: true
       LifecyclePolicy:
-        LifecyclePolicyText: |
-          {"rules":[{"rulePriority":1,"description":"Keep last 10 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+        LifecyclePolicyText: >
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 30 tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 30
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep untagged images for 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
       Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecr
         - Key: Environment
           Value: !Ref Environment
-        - Key: Service
-          Value: !Ref ServiceName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ECR Repository for Service Images
 
 Outputs:
   RepositoryUri:
     Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RepositoryUri
+  RepositoryArn:
+    Value: !GetAtt EcrRepository.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RepositoryArn
   RepositoryName:
     Value: !Ref EcrRepository
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RepositoryName

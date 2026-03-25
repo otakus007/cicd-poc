@@ -1,0 +1,89 @@
+# BuildSpec for Container Security Scanning Stage
+# Installs Trivy and scans the Docker image for HIGH/CRITICAL vulnerabilities
+#
+# Validates: Requirements 9.1, 9.2, 9.3, 9.4
+# - 9.1: Execute Trivy container image scanning against the built Docker image
+# - 9.2: Fail the build when HIGH or CRITICAL severity vulnerabilities are found
+# - 9.3: Output a scan report as a CodeBuild artifact in JSON format
+# - 9.4: Install Trivy during the install phase if not available
+
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "Installing Trivy vulnerability scanner..."
+      - TRIVY_VERSION="0.58.2"
+      - curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o trivy.tar.gz
+      - tar -xzf trivy.tar.gz trivy
+      - mv trivy /usr/local/bin/trivy
+      - chmod +x /usr/local/bin/trivy
+      - trivy --version
+      - rm -f trivy.tar.gz
+
+  pre_build:
+    commands:
+      - echo "============================================"
+      - echo "Security Scan Stage: ${SERVICE_NAME}"
+      - echo "============================================"
+      - echo "Build ID: ${CODEBUILD_BUILD_ID}"
+      - ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+      - |
+        if [ -n "${CODEBUILD_RESOLVED_SOURCE_VERSION}" ]; then
+          IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:0:8}"
+        else
+          IMAGE_TAG="latest"
+        fi
+      - echo "Scanning image: ${ECR_URI}:${IMAGE_TAG}"
+      - aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+  build:
+    commands:
+      - echo "Running Trivy container image scan..."
+      - |
+        trivy image \
+          --severity HIGH,CRITICAL \
+          --exit-code 1 \
+          --format json \
+          --output trivy-report.json \
+          "${ECR_URI}:${IMAGE_TAG}" || SCAN_EXIT_CODE=$?
+      - SCAN_EXIT_CODE="${SCAN_EXIT_CODE:-0}"
+      - echo "Trivy scan exit code: ${SCAN_EXIT_CODE}"
+
+  post_build:
+    commands:
+      - echo "============================================"
+      - echo "Security Scan Complete"
+      - echo "============================================"
+      - |
+        if [ -f "trivy-report.json" ]; then
+          HIGH_COUNT=$(cat trivy-report.json | python3 -c "
+        import json, sys
+        data = json.load(sys.stdin)
+        results = data.get('Results', [])
+        count = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'HIGH')
+        print(count)
+        " 2>/dev/null || echo "0")
+          CRITICAL_COUNT=$(cat trivy-report.json | python3 -c "
+        import json, sys
+        data = json.load(sys.stdin)
+        results = data.get('Results', [])
+        count = sum(1 for r in results for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'CRITICAL')
+        print(count)
+        " 2>/dev/null || echo "0")
+          echo "HIGH vulnerabilities:     ${HIGH_COUNT}"
+          echo "CRITICAL vulnerabilities: ${CRITICAL_COUNT}"
+        fi
+      - |
+        if [ "${SCAN_EXIT_CODE}" -ne 0 ]; then
+          echo "SECURITY SCAN FAILED: HIGH or CRITICAL vulnerabilities found"
+          exit 1
+        else
+          echo "No HIGH or CRITICAL vulnerabilities found"
+        fi
+
+artifacts:
+  files:
+    - trivy-report.json
+  name: security-scan-reports
+  discard-paths: yes
