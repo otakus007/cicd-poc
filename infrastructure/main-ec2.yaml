@@ -333,6 +333,31 @@ Resources:
           Value: !Ref ComputeType
 
   # ---------------------------------------------------------------------------
+  # ECR Repository Stack (Shared)
+  # Requirement 2.5: Shared ECR repository
+  # ---------------------------------------------------------------------------
+  EcrStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/ecr.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ServiceName: "shared"
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager Stack (Shared)
+  # ---------------------------------------------------------------------------
+  SecretsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/secrets.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ServiceName: "shared"
+
+  # ---------------------------------------------------------------------------
   # EC2-SPECIFIC STACKS
   # These stacks are specific to the EC2 deployment
   # Requirement 2.4: THE EC2 deployment SHALL use a distinct stack name suffix
@@ -528,13 +553,13 @@ Outputs:
     Description: Auto Scaling Group Name
     Value: !GetAtt EcsEc2ClusterStack.Outputs.AutoScalingGroupName
     Export:
-      Name: !Sub ${ProjectName}-${Environment}-Ec2AsgName
+      Name: !Sub ${ProjectName}-${Environment}-ec2-AsgName
 
   AutoScalingGroupArn:
     Description: Auto Scaling Group ARN
     Value: !GetAtt EcsEc2ClusterStack.Outputs.AutoScalingGroupArn
     Export:
-      Name: !Sub ${ProjectName}-${Environment}-Ec2AsgArn
+      Name: !Sub ${ProjectName}-${Environment}-ec2-AsgArn
 
   # ---------------------------------------------------------------------------
   # Launch Template Outputs
@@ -543,7 +568,7 @@ Outputs:
     Description: Launch Template ID
     Value: !GetAtt EcsEc2ClusterStack.Outputs.LaunchTemplateId
     Export:
-      Name: !Sub ${ProjectName}-${Environment}-Ec2LaunchTemplateId
+      Name: !Sub ${ProjectName}-${Environment}-ec2-LaunchTemplateId
 
   # ---------------------------------------------------------------------------
   # IAM Role Outputs
@@ -567,7 +592,7 @@ Outputs:
     Description: CloudWatch Log Group Name for EC2 cluster logs
     Value: !GetAtt EcsEc2ClusterStack.Outputs.EcsEc2LogGroupName
     Export:
-      Name: !Sub ${ProjectName}-${Environment}-Ec2ClusterLogGroupName
+      Name: !Sub ${ProjectName}-${Environment}-ec2-ClusterLogGroupName
 
   # ---------------------------------------------------------------------------
   # Deployment Summary

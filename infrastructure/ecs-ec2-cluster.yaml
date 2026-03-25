@@ -84,7 +84,7 @@ Parameters:
   ContainerInsightsEnabled:
     Type: String
     Description: Enable Container Insights for monitoring (enabled/disabled)
-    Default: enabled
+    Default: disabled
     AllowedValues:
       - enabled
       - disabled
@@ -164,6 +164,7 @@ Parameters:
 Conditions:
   IsProduction: !Equals [!Ref Environment, prod]
   IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
 
 # =============================================================================
 # RESOURCES
@@ -200,6 +201,12 @@ Resources:
         # Requirement 3.1: ComputeType tag for cost tracking
         - Key: ComputeType
           Value: ec2
+        # Finding 1.27: Savings Plan tagging for staging/prod
+        - !If
+          - IsDevelopment
+          - !Ref AWS::NoValue
+          - Key: SavingsPlanEligible
+            Value: "true"
 
   # ---------------------------------------------------------------------------
   # ECS Capacity Provider
@@ -368,6 +375,13 @@ Resources:
         - Key: AmazonECSManaged
           Value: "true"
           PropagateAtLaunch: true
+        # Finding 1.27: Savings Plan tagging for staging/prod
+        - !If
+          - IsDevelopment
+          - !Ref AWS::NoValue
+          - Key: SavingsPlanEligible
+            Value: "true"
+            PropagateAtLaunch: true
     UpdatePolicy:
       AutoScalingRollingUpdate:
         MinInstancesInService: 1
@@ -392,6 +406,11 @@ Resources:
           Arn: !Ref Ec2InstanceProfileArn
         SecurityGroupIds:
           - !Ref EcsSecurityGroupId
+        # Requirement 1.8: Enforce IMDSv2
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
         # Requirement 5.3: Enable detailed CloudWatch monitoring
         Monitoring:
           Enabled: true

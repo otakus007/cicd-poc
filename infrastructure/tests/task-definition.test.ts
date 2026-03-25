@@ -23,8 +23,8 @@ import * as yaml from "js-yaml";
 
 // Expected configuration from design document
 const EXPECTED_CONFIG = {
-  taskCpu: "512",
-  taskMemory: "1024",
+  taskCpu: "auto",
+  taskMemory: "auto",
   containerPort: 80,
   healthCheckPath: "/health",
   healthCheckInterval: 30,
@@ -301,16 +301,18 @@ describe("ECS Task Definition CloudFormation Template Validation", () => {
       expect(allowedValues).toContain("2048");
     });
 
-    test("should reference CPU parameter in task definition", () => {
+    test("should reference CPU parameter in task definition via !If conditional", () => {
       const taskDefProps = template.Resources?.TaskDefinition?.Properties;
-      const cpu = taskDefProps?.Cpu as { Ref: string };
-      expect(cpu.Ref).toBe("TaskCpu");
+      const cpu = taskDefProps?.Cpu as { "Fn::If": unknown[] };
+      expect(cpu["Fn::If"]).toBeDefined();
+      expect(cpu["Fn::If"][0]).toBe("UseMappedCpu");
     });
 
-    test("should reference memory parameter in task definition", () => {
+    test("should reference memory parameter in task definition via !If conditional", () => {
       const taskDefProps = template.Resources?.TaskDefinition?.Properties;
-      const memory = taskDefProps?.Memory as { Ref: string };
-      expect(memory.Ref).toBe("TaskMemory");
+      const memory = taskDefProps?.Memory as { "Fn::If": unknown[] };
+      expect(memory["Fn::If"]).toBeDefined();
+      expect(memory["Fn::If"][0]).toBe("UseMappedMemory");
     });
   });
 

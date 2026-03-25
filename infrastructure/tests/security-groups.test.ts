@@ -43,7 +43,7 @@ const EXPECTED_SECURITY_GROUPS = {
 		],
 		egress: [
 			{ port: 443, protocol: "tcp", destination: "0.0.0.0/0" },
-			{ port: 1433, protocol: "tcp", destinationVpcCidr: true },
+			{ port: 1521, protocol: "tcp", destinationVpcCidr: true },
 		],
 	},
 	codeBuild: {
@@ -283,11 +283,11 @@ describe("Security Groups CloudFormation Template Validation", () => {
 			expect(sg?.Type).toBe("AWS::EC2::SecurityGroup");
 		});
 
-		test("should have exactly 4 security groups", () => {
+		test("should have exactly 6 security groups", () => {
 			const securityGroups = Object.entries(template.Resources || {}).filter(
 				([_, resource]) => resource.Type === "AWS::EC2::SecurityGroup",
 			);
-			expect(securityGroups.length).toBe(4);
+			expect(securityGroups.length).toBe(6);
 		});
 	});
 
@@ -404,12 +404,12 @@ describe("Security Groups CloudFormation Template Validation", () => {
 			expect(httpsRule?.CidrIp).toBe("0.0.0.0/0");
 		});
 
-		test("should allow SQL Server (1433) egress to VPC CIDR only for database access", () => {
+		test("should allow Oracle (1521) egress to VPC CIDR only for database access", () => {
 			const sg = template.Resources?.EcsSecurityGroup;
 			const egress = sg?.Properties?.SecurityGroupEgress;
 
 			const sqlRule = egress?.find(
-				(rule) => rule.FromPort === 1433 && rule.ToPort === 1433,
+				(rule) => rule.FromPort === 1521 && rule.ToPort === 1521,
 			);
 			expect(sqlRule).toBeDefined();
 			expect(sqlRule?.IpProtocol).toBe("tcp");
@@ -417,17 +417,17 @@ describe("Security Groups CloudFormation Template Validation", () => {
 			expect(sqlRule?.CidrIp).toEqual({ Ref: "VpcCidr" });
 		});
 
-		test("should NOT allow SQL Server egress to 0.0.0.0/0 (least-privilege)", () => {
+		test("should NOT allow Oracle egress to 0.0.0.0/0 (least-privilege)", () => {
 			const sg = template.Resources?.EcsSecurityGroup;
 			const egress = sg?.Properties?.SecurityGroupEgress;
 
 			const sqlRule = egress?.find(
-				(rule) => rule.FromPort === 1433 && rule.ToPort === 1433,
+				(rule) => rule.FromPort === 1521 && rule.ToPort === 1521,
 			);
 			expect(sqlRule?.CidrIp).not.toBe("0.0.0.0/0");
 		});
 
-		test("should have exactly 2 egress rules (HTTPS and SQL Server)", () => {
+		test("should have exactly 2 egress rules (HTTPS and Oracle)", () => {
 			const sg = template.Resources?.EcsSecurityGroup;
 			const egress = sg?.Properties?.SecurityGroupEgress;
 
@@ -519,7 +519,7 @@ describe("Security Groups CloudFormation Template Validation", () => {
 			const sg = template.Resources?.EcsSecurityGroup;
 			const egress = sg?.Properties?.SecurityGroupEgress;
 
-			const sqlRule = egress?.find((rule) => rule.FromPort === 1433);
+			const sqlRule = egress?.find((rule) => rule.FromPort === 1521);
 			expect(sqlRule?.CidrIp).toEqual({ Ref: "VpcCidr" });
 		});
 

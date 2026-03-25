@@ -16,6 +16,8 @@ Parameters:
     Type: String
   LintProjectName:
     Type: String
+  SecurityScanProjectName:
+    Type: String
   BuildProjectName:
     Type: String
   PushProjectName:
@@ -26,6 +28,17 @@ Parameters:
     Type: String
   EcsServiceName:
     Type: String
+  NotificationTopicArn:
+    Type: String
+    Description: SNS Topic ARN for approval notifications
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsStaging: !Equals [!Ref Environment, staging]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+  # Requirement 2.1: Manual approval for prod/staging
+  RequiresApproval: !Or [!Condition IsProduction, !Condition IsStaging]
+  IsProductionOrStaging: !Or [!Condition IsProduction, !Condition IsStaging]
 
 Resources:
   ArtifactBucket:
@@ -44,8 +57,16 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
       LifecycleConfiguration:
         Rules:
+          - Id: IntelligentTieringTransition
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 7
           - Id: CleanupOldArtifacts
             Status: Enabled
             ExpirationInDays: 30
@@ -56,6 +77,48 @@ Resources:
           Value: !Ref Environment
         - Key: Service
           Value: !Ref ServiceName
+
+  S3EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-${ServiceName}-s3-backup-trigger
+      Description: Backup trigger for pipeline on S3 object creation
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref ArtifactBucket
+          object:
+            key:
+              - prefix: "trigger/"
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          Id: PipelineTarget
+          RoleArn: !GetAtt EventBridgePipelineRole.Arn
+
+  EventBridgePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipelineExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
 
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
@@ -127,9 +190,24 @@ Resources:
               OutputArtifacts:
                 - Name: LintOutput
               RunOrder: 1
+        - Name: SecurityScan
+          Actions:
+            - Name: VulnerabilityScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SecurityScanProjectName
+              InputArtifacts:
+                - Name: SwaggerGenOutput
+              OutputArtifacts:
+                - Name: SecurityScanOutput
+              RunOrder: 1
         - Name: Build
           Actions:
-            - Name: BuildAndTest
+            - Name: BuildAndPush
               ActionTypeId:
                 Category: Build
                 Owner: AWS
@@ -141,36 +219,6 @@ Resources:
                 - Name: SwaggerGenOutput
               OutputArtifacts:
                 - Name: BuildOutput
-              RunOrder: 1
-        - Name: Push
-          Actions:
-            - Name: PushToECR
-              ActionTypeId:
-                Category: Build
-                Owner: AWS
-                Provider: CodeBuild
-                Version: "1"
-              Configuration:
-                ProjectName: !Ref PushProjectName
-              InputArtifacts:
-                - Name: BuildOutput
-              OutputArtifacts:
-                - Name: PushOutput
-              RunOrder: 1
-        - Name: Deploy
-          Actions:
-            - Name: DeployToECS
-              ActionTypeId:
-                Category: Deploy
-                Owner: AWS
-                Provider: ECS
-                Version: "1"
-              Configuration:
-                ClusterName: !Ref ClusterName
-                ServiceName: !Ref EcsServiceName
-                FileName: imagedefinitions.json
-              InputArtifacts:
-                - Name: PushOutput
               RunOrder: 1
         - Name: ContractTest
           Actions:
@@ -186,6 +234,48 @@ Resources:
                 - Name: SwaggerGenOutput
               OutputArtifacts:
                 - Name: ContractTestOutput
+              RunOrder: 1
+        - Name: Approval
+          # Only require manual approval for production/staging
+          Actions:
+            - !If
+              - RequiresApproval
+              - Name: ManualApproval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: "1"
+                Configuration:
+                  NotificationArn: !Ref NotificationTopicArn
+                  CustomData: !Sub "Approve deployment of ${ServiceName} to ${Environment}"
+                RunOrder: 1
+              - Name: AutoApproval
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: "1"
+                Configuration:
+                  # Use any existing project as a no-op or a dedicated no-op project
+                  ProjectName: !Ref LintProjectName
+                InputArtifacts:
+                  - Name: SourceOutput
+                RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: DeployToECS
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: "1"
+              Configuration:
+                ClusterName: !Ref ClusterName
+                ServiceName: !Ref EcsServiceName
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: BuildOutput
               RunOrder: 1
       Tags:
         - Key: Environment

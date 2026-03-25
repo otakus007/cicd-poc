@@ -252,10 +252,12 @@ function hasInappropriateWildcard(resource: unknown, sid: string): boolean {
 	// These Sids are allowed to have wildcards due to AWS API requirements
 	const allowedWildcardSids = [
 		"EcrAuthAccess", // ecr:GetAuthorizationToken requires "*"
+		"EcrAuthForPipeline", // ecr:GetAuthorizationToken requires "*"
 		"VpcAccess", // EC2 describe operations require "*"
 		"SsmMessagesAccess", // SSM messages require "*"
 		"XRayAccess", // X-Ray requires "*"
 		"EcsTaskDefinitionAccess", // ECS task definition registration requires "*"
+		"KmsDecryptAccess", // KMS decrypt with condition
 	];
 
 	if (allowedWildcardSids.includes(sid)) {

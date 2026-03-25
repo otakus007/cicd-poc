@@ -2,12 +2,12 @@
  * Unit Tests for ECR CloudFormation Template Validation
  *
  * Validates: Requirements 5.2 - THE ECR SHALL retain images according to the configured lifecycle policy
- * Validates: Requirements 5.5 - THE ECR SHALL maintain at least the last 10 tagged images per repository
+ * Validates: Requirements 5.5 - THE ECR SHALL maintain at least the last 30 tagged images per repository
  *
  * Test Coverage:
  * 1. Template is valid YAML and can be parsed
  * 2. Scan-on-push is enabled for vulnerability detection
- * 3. Lifecycle policy retains last 10 tagged images with "v" prefix
+ * 3. Lifecycle policy retains last 30 tagged images with "v" prefix
  * 4. Lifecycle policy deletes untagged images older than 7 days
  * 5. Repository outputs are exported
  */
@@ -22,7 +22,7 @@ const EXPECTED_CONFIG = {
 	imageTagMutability: "MUTABLE",
 	encryptionType: "AES256",
 	lifecyclePolicy: {
-		taggedImagesRetention: 10,
+		taggedImagesRetention: 30,
 		tagPrefix: "v",
 		untaggedImagesDays: 7,
 	},
@@ -209,7 +209,7 @@ describe("ECR CloudFormation Template Validation", () => {
 
 		// Parse the lifecycle policy JSON
 		const lifecyclePolicyText =
-			template.Resources?.ECRRepository?.Properties?.LifecyclePolicy
+			template.Resources?.EcrRepository?.Properties?.LifecyclePolicy
 				?.LifecyclePolicyText;
 		if (lifecyclePolicyText) {
 			lifecyclePolicy = JSON.parse(lifecyclePolicyText) as LifecyclePolicy;
@@ -250,13 +250,13 @@ describe("ECR CloudFormation Template Validation", () => {
 
 	describe("ECR Repository Configuration", () => {
 		test("should define an ECR Repository resource", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			expect(ecrRepo).toBeDefined();
 			expect(ecrRepo?.Type).toBe("AWS::ECR::Repository");
 		});
 
 		test("should have repository name using project and environment", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			const repoName = ecrRepo?.Properties?.RepositoryName;
 			expect(repoName).toBeDefined();
 			// Should use Fn::Sub with ProjectName and Environment
@@ -264,14 +264,14 @@ describe("ECR CloudFormation Template Validation", () => {
 		});
 
 		test("should have AES256 encryption configured", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			const encryption = ecrRepo?.Properties?.EncryptionConfiguration;
 			expect(encryption).toBeDefined();
 			expect(encryption?.EncryptionType).toBe(EXPECTED_CONFIG.encryptionType);
 		});
 
 		test("should have MUTABLE image tag mutability", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			expect(ecrRepo?.Properties?.ImageTagMutability).toBe(
 				EXPECTED_CONFIG.imageTagMutability,
 			);
@@ -280,21 +280,21 @@ describe("ECR CloudFormation Template Validation", () => {
 
 	describe("Scan-on-Push Configuration (Requirement 5.3)", () => {
 		test("should have scan-on-push enabled", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			const scanConfig = ecrRepo?.Properties?.ImageScanningConfiguration;
 			expect(scanConfig).toBeDefined();
 			expect(scanConfig?.ScanOnPush).toBe(EXPECTED_CONFIG.scanOnPush);
 		});
 
 		test("should have ImageScanningConfiguration defined", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			expect(ecrRepo?.Properties?.ImageScanningConfiguration).toBeDefined();
 		});
 	});
 
 	describe("Lifecycle Policy Configuration (Requirements 5.2, 5.5)", () => {
 		test("should have lifecycle policy defined", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			expect(ecrRepo?.Properties?.LifecyclePolicy).toBeDefined();
 			expect(
 				ecrRepo?.Properties?.LifecyclePolicy?.LifecyclePolicyText,
@@ -324,7 +324,7 @@ describe("ECR CloudFormation Template Validation", () => {
 				expect(taggedRule).toBeDefined();
 			});
 
-			test("should retain last 10 tagged images", () => {
+			test("should retain last 30 tagged images", () => {
 				expect(taggedRule.selection.countNumber).toBe(
 					EXPECTED_CONFIG.lifecyclePolicy.taggedImagesRetention,
 				);
@@ -352,7 +352,7 @@ describe("ECR CloudFormation Template Validation", () => {
 			test("should have descriptive description", () => {
 				expect(taggedRule.description).toBeDefined();
 				expect(taggedRule.description.toLowerCase()).toContain("tagged");
-				expect(taggedRule.description).toContain("10");
+				expect(taggedRule.description).toContain("30");
 			});
 		});
 
@@ -433,14 +433,14 @@ describe("ECR CloudFormation Template Validation", () => {
 		test("Repository URI output should use GetAtt", () => {
 			const output = template.Outputs?.RepositoryUri as Record<string, unknown>;
 			expect(output?.Value).toEqual({
-				"Fn::GetAtt": ["ECRRepository", "RepositoryUri"],
+				"Fn::GetAtt": ["EcrRepository", "RepositoryUri"],
 			});
 		});
 
 		test("Repository ARN output should use GetAtt", () => {
 			const output = template.Outputs?.RepositoryArn as Record<string, unknown>;
 			expect(output?.Value).toEqual({
-				"Fn::GetAtt": ["ECRRepository", "Arn"],
+				"Fn::GetAtt": ["EcrRepository", "Arn"],
 			});
 		});
 
@@ -449,7 +449,7 @@ describe("ECR CloudFormation Template Validation", () => {
 				string,
 				unknown
 			>;
-			expect(output?.Value).toEqual({ Ref: "ECRRepository" });
+			expect(output?.Value).toEqual({ Ref: "EcrRepository" });
 		});
 
 		test("should have Export names for cross-stack references", () => {
@@ -474,7 +474,7 @@ describe("ECR CloudFormation Template Validation", () => {
 
 	describe("Resource Tagging", () => {
 		test("should have Name tag on ECR repository", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			const tags = ecrRepo?.Properties?.Tags as Array<{
 				Key: string;
 				Value: unknown;
@@ -485,7 +485,7 @@ describe("ECR CloudFormation Template Validation", () => {
 		});
 
 		test("should have Environment tag on ECR repository", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			const tags = ecrRepo?.Properties?.Tags as Array<{
 				Key: string;
 				Value: unknown;
@@ -495,7 +495,7 @@ describe("ECR CloudFormation Template Validation", () => {
 		});
 
 		test("should have Project tag on ECR repository", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			const tags = ecrRepo?.Properties?.Tags as Array<{
 				Key: string;
 				Value: unknown;
@@ -505,7 +505,7 @@ describe("ECR CloudFormation Template Validation", () => {
 		});
 
 		test("should have Purpose tag on ECR repository", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			const tags = ecrRepo?.Properties?.Tags as Array<{
 				Key: string;
 				Value: unknown;
@@ -559,12 +559,12 @@ describe("ECR CloudFormation Template Validation", () => {
 
 	describe("Security Configuration", () => {
 		test("should have encryption enabled", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			expect(ecrRepo?.Properties?.EncryptionConfiguration).toBeDefined();
 		});
 
 		test("should use AES256 encryption (AWS managed key)", () => {
-			const ecrRepo = template.Resources?.ECRRepository;
+			const ecrRepo = template.Resources?.EcrRepository;
 			expect(ecrRepo?.Properties?.EncryptionConfiguration?.EncryptionType).toBe(
 				"AES256",
 			);

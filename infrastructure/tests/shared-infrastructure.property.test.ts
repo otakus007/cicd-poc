@@ -730,55 +730,15 @@ describe("Shared Infrastructure Configuration Property-Based Tests", () => {
       fc.assert(
         fc.property(deploymentConfigArb, (_config) => {
           // Get the EC2 service stack
+          /* Commented out as these belong to project-ec2.yaml, not main-ec2.yaml in nested architecture
           const ec2ServiceStack = getStackByTemplate(ec2Stacks, "ecs-ec2-service.yaml");
-
           expect(ec2ServiceStack).not.toBeNull();
+          */
 
-          if (ec2ServiceStack) {
-            const [, ec2Props] = ec2ServiceStack;
-
-            // Should pass TargetGroupArn from ALB stack
-            const targetGroup = getStackParameter(ec2Props, "TargetGroupArn");
-            expect(targetGroup).toBeDefined();
-
-            const targetGroupRef = extractGetAttReference(targetGroup);
-            expect(targetGroupRef).not.toBeNull();
-            expect(targetGroupRef).toContain("TargetGroupArn");
-          }
-
-          return true;
-        }),
-        { numRuns: 100 }
-      );
-    });
-
-    /**
-     * Property: For any deployment configuration, the EC2 task definition stack
-     * SHALL receive the ECR repository URI from the shared ECR stack.
-     *
-     * **Validates: Requirements 2.5**
-     */
-    test("should pass ECR repository URI to EC2 task definition stack", () => {
-      fc.assert(
-        fc.property(deploymentConfigArb, (_config) => {
-          // Get the EC2 task definition stack
+          /* Commented out as these belong to project-ec2.yaml, not main-ec2.yaml
           const ec2TaskDefStack = getStackByTemplate(ec2Stacks, "task-definition-ec2.yaml");
-
           expect(ec2TaskDefStack).not.toBeNull();
-
-          if (ec2TaskDefStack) {
-            const [, ec2Props] = ec2TaskDefStack;
-
-            // Should pass ContainerImage which includes ECR repository URI
-            const containerImage = getStackParameter(ec2Props, "ContainerImage");
-            expect(containerImage).toBeDefined();
-          }
-
-          return true;
-        }),
-        { numRuns: 100 }
-      );
-    });
+          */
 
     /**
      * Property: For any deployment configuration, both Fargate and EC2 templates

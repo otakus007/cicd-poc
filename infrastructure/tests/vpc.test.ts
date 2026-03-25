@@ -496,18 +496,23 @@ describe("VPC CloudFormation Template Validation", () => {
 			});
 		});
 
-		test("should associate private subnet 2 with private route table 2", () => {
-			const association =
-				template.Resources?.PrivateSubnet2RouteTableAssociation;
-			expect(association).toBeDefined();
-			expect(association?.Type).toBe("AWS::EC2::SubnetRouteTableAssociation");
-			expect(association?.Properties?.SubnetId).toEqual({
-				Ref: "PrivateSubnet2",
+			test("should associate private subnet 2 with private route table 2", () => {
+				const association =
+					template.Resources?.PrivateSubnet2RouteTableAssociation;
+				expect(association).toBeDefined();
+				expect(association?.Type).toBe("AWS::EC2::SubnetRouteTableAssociation");
+				expect(association?.Properties?.SubnetId).toEqual({
+					Ref: "PrivateSubnet2",
+				});
+				// Updated to expect conditional RouteTableId
+				expect(association?.Properties?.RouteTableId).toEqual({
+					"Fn::If": [
+						"UseHighAvailability",
+						{ Ref: "PrivateRouteTable2" },
+						{ Ref: "PrivateRouteTable1" }
+					]
+				});
 			});
-			expect(association?.Properties?.RouteTableId).toEqual({
-				Ref: "PrivateRouteTable2",
-			});
-		});
 	});
 
 	describe("CloudFormation Outputs", () => {

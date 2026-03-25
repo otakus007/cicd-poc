@@ -230,6 +230,31 @@ Resources:
           Value: !Ref ProjectName
 
   # ---------------------------------------------------------------------------
+  # ECR Repository Stack (Shared)
+  # Requirement 2.5: Shared ECR repository
+  # ---------------------------------------------------------------------------
+  EcrStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/ecr.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ServiceName: "shared"
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager Stack (Shared)
+  # ---------------------------------------------------------------------------
+  SecretsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/${TemplatesBucketPrefix}/secrets.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ServiceName: "shared"
+
+  # ---------------------------------------------------------------------------
   # ECS Cluster Stack
   # ---------------------------------------------------------------------------
   EcsClusterStack:
@@ -251,7 +276,7 @@ Resources:
           Value: !Ref ComputeType
 
   # ---------------------------------------------------------------------------
-  # Monitoring and Observability Stack
+  # Monitoring and Observability Stack (Shared)
   # ---------------------------------------------------------------------------
   MonitoringStack:
     Type: AWS::CloudFormation::Stack
@@ -343,4 +368,3 @@ Outputs:
   DashboardName:
     Description: CloudWatch Dashboard Name
     Value: !GetAtt MonitoringStack.Outputs.DashboardName
-

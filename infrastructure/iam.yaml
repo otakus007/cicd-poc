@@ -44,6 +44,20 @@ Parameters:
     MaxLength: 32
     ConstraintDescription: Must be lowercase alphanumeric with hyphens, 3-32 characters
 
+  SecretsManagerKmsKeyArn:
+    Type: String
+    Description: ARN of the KMS key used for Secrets Manager encryption (default uses the AWS-managed key)
+    Default: ""
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  HasCustomKmsKey: !Not
+    - !Equals
+      - !Ref SecretsManagerKmsKeyArn
+      - ""
+
 # =============================================================================
 # RESOURCES
 # =============================================================================
@@ -132,6 +146,9 @@ Resources:
               - ecs:ListTaskDefinitions
               - ecs:TagResource
             Resource: "*"
+            Condition:
+              StringLike:
+                ecs:ResourceTag/Project: !Ref ProjectName
           # SNS permissions - publish notifications
           - Sid: SnsPublishAccess
             Effect: Allow
@@ -274,6 +291,9 @@ Resources:
               - ec2:DescribeDhcpOptions
               - ec2:DescribeVpcs
             Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
           - Sid: VpcNetworkInterfaceAccess
             Effect: Allow
             Action:
@@ -346,16 +366,17 @@ Resources:
             Action:
               - secretsmanager:GetSecretValue
             Resource:
-              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/*/db/*
-              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/db/*
-              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/db/*
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/*
           # KMS permissions - decrypt secrets if using CMK
           - Sid: KmsDecryptAccess
             Effect: Allow
             Action:
               - kms:Decrypt
             Resource:
-              - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              - !If
+                - HasCustomKmsKey
+                - !Ref SecretsManagerKmsKeyArn
+                - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/secretsmanager
             Condition:
               StringEquals:
                 kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com

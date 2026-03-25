@@ -34,12 +34,12 @@ Parameters:
   ListenerRulePriority:
     Type: Number
     Default: 100
-  ContainerCpu:
+  TaskCpu:
     Type: String
-    Default: "512"
-  ContainerMemory:
+    Default: "auto"
+  TaskMemory:
     Type: String
-    Default: "1024"
+    Default: "auto"
   DesiredCount:
     Type: Number
     Default: 0
@@ -88,8 +88,8 @@ Resources:
         Environment: !Ref Environment
         ProjectName: !Ref InfraProjectName
         ServiceName: !Ref ServiceName
-        ContainerCpu: !Ref ContainerCpu
-        ContainerMemory: !Ref ContainerMemory
+        TaskCpu: !Ref TaskCpu
+        TaskMemory: !Ref TaskMemory
         ContainerPort: !Ref ContainerPort
         PathBase: !Ref PathBase
         ExecutionRoleArn:
@@ -173,12 +173,15 @@ Resources:
         SourceProjectName: !GetAtt CodeBuildStack.Outputs.SourceProjectName
         SwaggerGenProjectName: !GetAtt CodeBuildStack.Outputs.SwaggerGenProjectName
         LintProjectName: !GetAtt CodeBuildStack.Outputs.LintProjectName
+        SecurityScanProjectName: !GetAtt CodeBuildStack.Outputs.SecurityScanProjectName
         BuildProjectName: !GetAtt CodeBuildStack.Outputs.BuildProjectName
         PushProjectName: !GetAtt CodeBuildStack.Outputs.PushProjectName
         ContractTestProjectName: !GetAtt CodeBuildStack.Outputs.ContractTestProjectName
         ClusterName:
           Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-Ec2ClusterName
         EcsServiceName: !GetAtt EcsServiceStack.Outputs.ServiceName
+        NotificationTopicArn:
+          Fn::ImportValue: !Sub ${InfraProjectName}-${Environment}-ec2-NotificationTopicArn
 
 Outputs:
   ServiceName:
