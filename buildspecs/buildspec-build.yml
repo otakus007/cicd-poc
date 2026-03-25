@@ -1,17 +1,8 @@
-# buildspec-build.yml — Generic Docker Build
-# ============================================================================
-# Generic buildspec that works for ANY project with a Dockerfile.
-# No project-specific configuration needed — all values come from
-# CodeBuild environment variables injected by the project stack.
-#
-# Injected env vars (from project.yaml CodeBuild config):
-#   PROJECT_NAME, ENVIRONMENT, SERVICE_NAME
-#
-# Convention: Dockerfile must exist at the repo root.
-# Override: Set DOCKERFILE_PATH env var in CodeBuild project config.
-# ============================================================================
-
 version: 0.2
+
+env:
+  variables:
+    IMAGE_NAME: "${SERVICE_NAME}"
 
 phases:
   pre_build:
@@ -19,58 +10,59 @@ phases:
       - echo "============================================"
       - 'echo "Build Stage: ${SERVICE_NAME}"'
       - echo "============================================"
-
-      # Dockerfile path — default to repo root, overridable via env var
       - DOCKERFILE_PATH="${DOCKERFILE_PATH:-Dockerfile}"
-
       - |
         if [ ! -f "$DOCKERFILE_PATH" ]; then
           echo "ERROR: Dockerfile not found at $DOCKERFILE_PATH"
-          echo "Each project must have a Dockerfile in its source repo."
           exit 1
         fi
-      - 'echo "Dockerfile: $DOCKERFILE_PATH"'
-      # Resolve commit SHA for image tagging
       - |
         if [ -n "${CODEBUILD_RESOLVED_SOURCE_VERSION}" ]; then
           COMMIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION}"
-        elif command -v git &>/dev/null && git rev-parse HEAD &>/dev/null 2>&1; then
-          COMMIT_SHA=$(git rev-parse HEAD)
         else
           COMMIT_SHA="build-$(date +%Y%m%d%H%M%S)"
         fi
       - SHORT_SHA="${COMMIT_SHA:0:8}"
-      - IMAGE_NAME="${SERVICE_NAME}"
       - 'echo "Commit: ${SHORT_SHA}"'
 
   build:
     commands:
-      - echo "Building Docker image..."
+      - echo "Build phase - preparing for Docker build..."
+
+  post_build:
+    commands:
+      - echo "Building and Pushing Docker image..."
       - |
         docker build \
           -t "${IMAGE_NAME}:${COMMIT_SHA}" \
           -t "${IMAGE_NAME}:${SHORT_SHA}" \
           -t "${IMAGE_NAME}:latest" \
           -f "$DOCKERFILE_PATH" \
-          --build-arg BUILD_VERSION="${COMMIT_SHA}" \
           .
-      - 'echo "Docker image built: ${IMAGE_NAME}:${SHORT_SHA}"'
-
-  post_build:
-    commands:
-      # Save metadata for push stage
+      - ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+      - aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - docker tag "${IMAGE_NAME}:${COMMIT_SHA}" "${ECR_URI}:${COMMIT_SHA}"
+      - docker tag "${IMAGE_NAME}:${SHORT_SHA}" "${ECR_URI}:${SHORT_SHA}"
+      - docker tag "${IMAGE_NAME}:latest" "${ECR_URI}:latest"
+      - docker push "${ECR_URI}:${COMMIT_SHA}"
+      - docker push "${ECR_URI}:${SHORT_SHA}"
+      - docker push "${ECR_URI}:latest"
+      - printf '[{"name":"%s-container","imageUri":"%s"}]' "$SERVICE_NAME" "$ECR_URI:$SHORT_SHA" > imagedefinitions.json
       - |
         cat > image-metadata.json << EOF
         {
           "imageName": "${IMAGE_NAME}",
           "commitSha": "${COMMIT_SHA}",
-          "shortSha": "${SHORT_SHA}"
+          "shortSha": "${SHORT_SHA}",
+          "ecrUri": "${ECR_URI}"
         }
         EOF
-      - echo "Build stage completed"
 
 artifacts:
   files:
-    - "**/*"
-  exclude-paths:
-    - ".git/**/*"
+    - imagedefinitions.json
+
+secondary-artifacts:
+  image-metadata:
+    files:
+      - image-metadata.json

@@ -12,7 +12,7 @@ version: 0.2
 phases:
   install:
     runtime-versions:
-      dotnet: 10.0
+      dotnet: ${DOTNET_VERSION:-10.0}
     commands:
       - echo "Checking for existing OpenAPI specification..."
 
